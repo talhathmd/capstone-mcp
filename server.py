@@ -15,9 +15,10 @@ FORCE_H1  = os.getenv("BIO_FORCE_HTTP1", "0") in ("1","true","True")
 T_CONNECT = float(os.getenv("BIO_HTTP_TIMEOUT_CONNECT", "8"))
 T_READ    = float(os.getenv("BIO_HTTP_TIMEOUT_READ",    "20"))
 T_WRITE   = float(os.getenv("BIO_HTTP_TIMEOUT_WRITE",   "10"))
+T_POOL    = float(os.getenv("BIO_HTTP_TIMEOUT_POOL",    "5"))
 
 def _timeout():
-    return httpx.Timeout(connect=T_CONNECT, read=T_READ, write=T_WRITE)
+    return httpx.Timeout(connect=T_CONNECT, read=T_READ, write=T_WRITE, pool=T_POOL)
 
 def _headers(for_get: bool = False) -> Dict[str,str]:
     h = {"Accept":"application/sparql-results+json","User-Agent":UA}
