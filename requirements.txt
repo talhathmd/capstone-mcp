@@ -2,4 +2,4 @@ mcp
 httpx
 uvicorn[standard]
 starlette
-"httpx[http2]"
+httpx[http2]
