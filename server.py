@@ -1,11 +1,11 @@
-# server.py — Bio MCP (Rhea + UniProt), root "/" MCP with safe GET /healthz and GET /
+# server.py — Bio MCP (Rhea + UniProt), root "/" MCP (mounted), plus /healthz and GET /
 import os, re, asyncio
 from typing import Any, Dict, List
 import httpx
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 
 # ---- Endpoints ----
 UNIPROT = os.getenv("UNIPROT_SPARQL", "https://sparql.uniprot.org/sparql")
@@ -18,10 +18,10 @@ FORCE_H1  = os.getenv("BIO_FORCE_HTTP1", "0") in ("1","true","True")
 T_CONNECT = float(os.getenv("BIO_HTTP_TIMEOUT_CONNECT", "8"))
 T_READ    = float(os.getenv("BIO_HTTP_TIMEOUT_READ",    "20"))
 T_WRITE   = float(os.getenv("BIO_HTTP_TIMEOUT_WRITE",   "10"))
-T_POOL    = float(os.getenv("BIO_HTTP_TIMEOUT_POOL",    "5"))  # IMPORTANT: httpx needs pool
+T_POOL    = float(os.getenv("BIO_HTTP_TIMEOUT_POOL",    "5"))  # httpx needs pool timeout too
 
 def _timeout():
-    # Either use a single default OR set all four: connect/read/write/pool.
+    # httpx requires either a single default or all four fields — include pool.
     return httpx.Timeout(connect=T_CONNECT, read=T_READ, write=T_WRITE, pool=T_POOL)
 
 def _headers(for_get: bool = False) -> Dict[str, str]:
@@ -39,8 +39,8 @@ async def _post_sparql(endpoint: str, query: str) -> Dict[str, Any]:
     """
     Robust SPARQL:
       1) POST
-      2) on 429/5xx or timeout → GET fallback
-    Always returns JSON (or {"error": {...}}).
+      2) retry via GET on 429/5xx or timeout
+    Always returns JSON or {"error": {...}}.
     """
     try:
         async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, http2=not FORCE_H1) as client:
@@ -66,7 +66,8 @@ async def _post_sparql(endpoint: str, query: str) -> Dict[str, Any]:
 
 # ---------- MCP tools (raw only) ----------
 mcp = FastMCP("graph-bio")
-mcp.settings.streamable_http_path = "/"   # MCP is at root for POST /
+mcp.settings.streamable_http_path = "/"   # MCP defines its path as "/"
+mcp_app = mcp.streamable_http_app()       # ASGI sub-app (must be MOUNTED, not called)
 
 @mcp.tool()
 async def execute_sparql_uniprot(query_string: str, format: str = "json") -> Dict[str, Any]:
@@ -78,7 +79,7 @@ async def execute_sparql_rhea(query_string: str, format: str = "json") -> Dict[s
     """Run a SPARQL query against the Rhea endpoint."""
     return await _post_sparql(RHEA, query_string)
 
-# -------- Optional: small label search helpers --------
+# -------- Optional label search helpers --------
 UNIPROT_LABEL_SEARCH = """
 PREFIX up:   <http://purl.uniprot.org/core/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -198,24 +199,18 @@ async def debug_ping():
         return await _post_sparql(ep, "SELECT (1 AS ?x) WHERE {}")
     return {"uniprot": await ping(UNIPROT), "rhea": await ping(RHEA)}
 
-# ---- Build ASGI with explicit root dispatcher ----
-mcp_app = mcp.streamable_http_app()
-
+# ---- Build ASGI: GET /healthz, GET / (friendly), POST / → MCP (via mount) ----
 async def healthz(_):
     return JSONResponse({"ok": True, "service": "graph-bio", "mcp_path": "/"})
 
-async def root_dispatch(request):
-    # Accept GET / for sanity, but forward POST / to the MCP app
-    if request.method == "GET":
-        return PlainTextResponse("OK. MCP endpoint expects POST /.", status_code=200)
-    if request.method == "POST":
-        # Hand off to the MCP starlette app
-        return await mcp_app(request.scope, request.receive, request._send)  # pylint: disable=protected-access
-    return PlainTextResponse("Method Not Allowed", status_code=405)
+async def root_get(_):
+    return PlainTextResponse("OK. POST / is the MCP endpoint.", status_code=200)
 
+# IMPORTANT: order matters. Route(GET "/") first; then Mount("/") so POST "/" goes to MCP.
 app = Starlette(routes=[
     Route("/healthz", endpoint=healthz, methods=["GET"]),
-    Route("/",        endpoint=root_dispatch, methods=["GET","POST"]),
+    Route("/",        endpoint=root_get, methods=["GET"]),
+    Mount("/",        app=mcp_app),
 ])
 
 if __name__ == "__main__":
