@@ -24,25 +24,52 @@ async def _post_sparql(
     endpoint: str,
     query: str,
     timeout: float = 60.0,
-    retries: int = 2
+    retries: int = 2,
+    prefer_get_fallback: bool = True,
+    force_http1: bool = True,
 ) -> Dict[str, Any]:
-    """POST a SPARQL query and return parsed JSON or a structured error."""
+    """
+    POST SPARQL with fallback to GET (for networks/proxies that block POST bodies),
+    and optionally force HTTP/1.1 to avoid HTTP/2 quirks on some paths.
+    """
     headers = {
         "Accept": "application/sparql-results+json",
         "User-Agent": UA,
         "Content-Type": "application/x-www-form-urlencoded",
     }
+
+    # Timeouts tuned to make connect problems fail fast but allow slow reads.
+    t = httpx.Timeout(connect=10.0, read=timeout, write=20.0, pool=10.0)
     backoff = 0.75
-    for attempt in range(retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(endpoint, data={"query": query}, headers=headers)
+
+    async def _try_post():
+        async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=not force_http1) as client:
+            r = await client.post(endpoint, data={"query": query}, headers=headers)
             if r.status_code >= 400:
                 return {"error": {"status_code": r.status_code, "body": r.text[:2000]}}
             return r.json()
+
+    async def _try_get():
+        # GET uses query string; some proxies only allow this path reliably.
+        hdrs = {k: v for k, v in headers.items() if k != "Content-Type"}
+        async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=not force_http1) as client:
+            r = await client.get(endpoint, params={"query": query}, headers=hdrs)
+            if r.status_code >= 400:
+                return {"error": {"status_code": r.status_code, "body": r.text[:2000]}}
+            return r.json()
+
+    # Try POST with retries; on final failure optionally fall back to GET once.
+    for attempt in range(retries + 1):
+        try:
+            return await _try_post()
         except (httpx.TimeoutException, httpx.TransportError) as e:
             if attempt == retries:
-                return {"error": {"status_code": 599, "body": f"{type(e).__name__}: {e}"}}
+                if prefer_get_fallback:
+                    try:
+                        return await _try_get()
+                    except (httpx.TimeoutException, httpx.TransportError) as e2:
+                        return {"error": {"status_code": 599, "body": f"GET fallback {type(e2).__name__}: {e2}"}}
+                return {"error": {"status_code": 599, "body": f"POST {type(e).__name__}: {e}"}}
             await asyncio.sleep(backoff)
             backoff *= 2
 
