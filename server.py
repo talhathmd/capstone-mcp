@@ -223,11 +223,9 @@ mcp_app = mcp.streamable_http_app()
 async def healthz(_):
     return JSONResponse({"ok": True, "service": "graph-bio", "paths": ["/healthz", "/mcp"]})
 
-# NOTE: MCP lives under /mcp (root remains free for simple health/docs)
 app = Starlette(routes=[
     Route("/healthz", endpoint=healthz, methods=["GET"]),
-    Route("/", endpoint=lambda req: PlainTextResponse("OK. MCP endpoint is at /mcp.", status_code=200), methods=["GET"]),
-    Mount("/mcp", app=mcp_app),
+    Mount("/", app=mcp_app),  
 ])
 
 if __name__ == "__main__":
