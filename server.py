@@ -1,30 +1,28 @@
-# server.py — Bio MCP (Rhea + UniProt), raw tools only; MCP on "/" AND "/mcp"
+# server.py — Bio MCP (Rhea + UniProt), raw tools only at root "/"
 import os, re, asyncio
 from typing import Any, Dict, List
 import httpx
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
 
 # ---- Endpoints ----
 UNIPROT = os.getenv("UNIPROT_SPARQL", "https://sparql.uniprot.org/sparql")
 RHEA    = os.getenv("RHEA_SPARQL",    "https://sparql.rhea-db.org/sparql")
 
 # ---- Headers / timeouts ----
-UA        = os.getenv("BIO_UA",  "TalhaCapstone/0.7 (contact: you@example.com)")
+UA        = os.getenv("BIO_UA",  "TalhaCapstone/0.8 (contact: you@example.com)")
 FROM      = os.getenv("BIO_FROM", "")
 FORCE_H1  = os.getenv("BIO_FORCE_HTTP1", "0") in ("1","true","True")
 T_CONNECT = float(os.getenv("BIO_HTTP_TIMEOUT_CONNECT", "8"))
 T_READ    = float(os.getenv("BIO_HTTP_TIMEOUT_READ",    "20"))
 T_WRITE   = float(os.getenv("BIO_HTTP_TIMEOUT_WRITE",   "10"))
-T_POOL    = float(os.getenv("BIO_HTTP_TIMEOUT_POOL",    "5"))   # IMPORTANT: httpx needs pool timeout too
+T_POOL    = float(os.getenv("BIO_HTTP_TIMEOUT_POOL",    "5"))  # IMPORTANT
 
 def _timeout():
+    # httpx requires either one default or all four fields; include pool=...
     return httpx.Timeout(connect=T_CONNECT, read=T_READ, write=T_WRITE, pool=T_POOL)
 
-def _headers(for_get: bool = False) -> Dict[str,str]:
-    h = {"Accept":"application/sparql-results+json","User-Agent":UA}
+def _headers(for_get: bool = False) -> Dict[str, str]:
+    h = {"Accept": "application/sparql-results+json", "User-Agent": UA}
     if not for_get:
         h["Content-Type"] = "application/x-www-form-urlencoded"
     if FROM:
@@ -32,13 +30,19 @@ def _headers(for_get: bool = False) -> Dict[str,str]:
     return h
 
 def _sparql_str(s: str) -> str:
-    return s.replace("\\","\\\\").replace('"','\\"')
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 async def _post_sparql(endpoint: str, query: str) -> Dict[str, Any]:
+    """
+    Robust SPARQL:
+      1) POST
+      2) if 429/5xx or timeout → GET fallback
+    Returns JSON or {"error": {...}}. No exceptions bubble out.
+    """
     try:
         async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, http2=not FORCE_H1) as client:
             r = await client.post(endpoint, data={"query": query}, headers=_headers())
-        if r.status_code in (429,500,502,503,504):
+        if r.status_code in (429, 500, 502, 503, 504):
             await asyncio.sleep(0.6)
             async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, http2=not FORCE_H1) as client:
                 r = await client.get(endpoint, params={"query": query}, headers=_headers(for_get=True))
@@ -59,16 +63,19 @@ async def _post_sparql(endpoint: str, query: str) -> Dict[str, Any]:
 
 # ---------- MCP tools (raw) ----------
 mcp = FastMCP("graph-bio")
-mcp.settings.streamable_http_path = "/"   # MCP app will serve at "/"
+mcp.settings.streamable_http_path = "/"   # MCP lives at root
+
 @mcp.tool()
 async def execute_sparql_uniprot(query_string: str, format: str = "json") -> Dict[str, Any]:
+    """Run a SPARQL query against the UniProt endpoint."""
     return await _post_sparql(UNIPROT, query_string)
 
 @mcp.tool()
 async def execute_sparql_rhea(query_string: str, format: str = "json") -> Dict[str, Any]:
+    """Run a SPARQL query against the Rhea endpoint."""
     return await _post_sparql(RHEA, query_string)
 
-# -------- Optional label search helpers --------
+# -------- Label search helpers (optional) --------
 UNIPROT_LABEL_SEARCH = """
 PREFIX up:   <http://purl.uniprot.org/core/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -88,6 +95,7 @@ SELECT ?id ?label ?acc WHERE {
 ORDER BY ?label
 LIMIT %d
 """
+
 RHEA_LABEL_SEARCH = """
 PREFIX rh:   <http://rdf.rhea-db.org/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -134,10 +142,11 @@ async def search(query: str, limit: int = 10, language: str = "en", source: str 
     if src in ("rhea","both","all"):    tasks.append(_search_rhea(query, limit))
     results=[]
     for coro in tasks:
-        try: results += await asyncio.wait_for(coro, timeout=T_CONNECT+T_READ+2)
+        try:
+            results += await asyncio.wait_for(coro, timeout=T_CONNECT+T_READ+2)
         except Exception as e:
             results += [{"type":"error","id":"search","title":"timeout","snippet":str(e),"source":"search"}]
-    # de-dup + collate
+    # de-dup
     seen=set(); dedup=[]
     for r in results:
         rid=(r.get("id"), r.get("source"))
@@ -186,17 +195,8 @@ async def debug_ping():
         return await _post_sparql(ep, "SELECT (1 AS ?x) WHERE {}")
     return {"uniprot": await ping(UNIPROT), "rhea": await ping(RHEA)}
 
-# ---- Build ASGI: serve MCP at "/" AND "/mcp"; add /healthz ----
-mcp_app = mcp.streamable_http_app()
-
-async def healthz(_):
-    return JSONResponse({"ok": True, "service": "graph-bio", "mcp_paths": ["/", "/mcp"]})
-
-app = Starlette(routes=[
-    Route("/healthz", endpoint=healthz, methods=["GET"]),
-    Mount("/",   app=mcp_app),   # POST / goes to MCP
-    Mount("/mcp", app=mcp_app),  # POST /mcp also works (belt & suspenders)
-])
+# ---- ASGI app at root ----
+app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
     import uvicorn
