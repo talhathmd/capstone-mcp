@@ -118,10 +118,48 @@ SELECT ?id ?acc ?eq WHERE {
 ORDER BY ?acc
 LIMIT %d
 """
+MNEMONIC_EQ_Q = """
+PREFIX up: <http://purl.uniprot.org/core/>
+SELECT ?id ?acc WHERE {
+  ?id a up:Protein ; up:mnemonic ?acc .
+  FILTER(?acc = \"%s\")
+}
+LIMIT %d
+"""
+
+def _is_mnemonic_like(s: str) -> bool:
+    """
+    Heuristic: short, no spaces, letters/digits/hyphens/underscores.
+    Covers typical protein symbols (EGFR, BRCA1) and mnemonics (EGFR_HUMAN).
+    """
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{3,20}", s or ""))
 
 async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
+    # 1) Fast path for mnemonic-like tokens (index-friendly: exact equality, no LCASE)
+    if _is_mnemonic_like(needle):
+        q_fast = MNEMONIC_EQ_Q % (_sparql_str(needle), limit)
+        data_fast = await _post_sparql(UNIPROT, q_fast, timeout=90.0)  # give UniProt more read time
+        if "error" not in data_fast:
+            out_fast: List[Dict[str, Any]] = []
+            for b in data_fast.get("results", {}).get("bindings", []):
+                iri  = b["id"]["value"]
+                acc  = b.get("acc", {}).get("value") or iri.rsplit("/", 1)[-1]
+                out_fast.append({
+                    "type": "uniprot:protein",
+                    "id": iri,
+                    "title": acc,
+                    "snippet": "UniProtKB protein",
+                    "url": iri,
+                    "source": "uniprot",
+                })
+            if out_fast:
+                return out_fast
+        # if no hits (or an error), fall through to general label search
+
+    # 2) General label search (your original query); this can be slow on UniProt → use longer timeout
     q = UNIPROT_LABEL_SEARCH % (_sparql_str(needle), limit)
-    data = await _post_sparql(UNIPROT, q)
+    data = await _post_sparql(UNIPROT, q, timeout=90.0)  # bump read timeout for UniProt label lookups
+
     if "error" in data:
         return [{
             "type": "error",
@@ -131,12 +169,21 @@ async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str,
             "url": UNIPROT,
             "source": "uniprot",
         }]
+
     out: List[Dict[str, Any]] = []
     for b in data.get("results", {}).get("bindings", []):
         iri = b["id"]["value"]
         title = b.get("label", {}).get("value") or b.get("acc", {}).get("value") or iri.rsplit("/", 1)[-1]
-        out.append({"type": "uniprot:protein", "id": iri, "title": title, "snippet": "UniProtKB protein", "url": iri, "source": "uniprot"})
+        out.append({
+            "type": "uniprot:protein",
+            "id": iri,
+            "title": title,
+            "snippet": "UniProtKB protein",
+            "url": iri,
+            "source": "uniprot",
+        })
     return out
+
 
 async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
     q = RHEA_LABEL_SEARCH % (_sparql_str(needle), limit)
