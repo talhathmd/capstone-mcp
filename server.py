@@ -1,4 +1,4 @@
-# server.py — Rhea-only MCP for NL→SPARQL:
+# server.py — Rhea-only MCP for NL→SPARQL at root "/"
 import os
 import re
 import asyncio
@@ -7,10 +7,11 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 RHEA_SPARQL = os.getenv("RHEA_SPARQL", "https://sparql.rhea-db.org/sparql")
-UA          = os.getenv("BIO_UA", "GraphBio-RheaOnly/2.0 (contact: you@example.com)")
+UA          = os.getenv("BIO_UA", "GraphBio-RheaOnly/2.1 (contact: you@example.com)")
 
 mcp = FastMCP("graph-bio-rhea")
-mcp.settings.streamable_http_path = "/"  # MCP lives at root
+# Make the MCP SSE endpoint live at root "/"
+mcp.settings.streamable_http_path = "/"
 
 # -------------------- HTTP/2 detection --------------------
 try:
@@ -21,10 +22,10 @@ except Exception:
 
 def _http2_enabled() -> bool:
     """
-    BIO_HTTP2 env:
-      - off/false/0/no  -> force HTTP/1.1
-      - on/true/1/yes   -> use HTTP/2 if installed, else HTTP/1.1
-      - auto (default)  -> use HTTP/2 only if 'h2' is installed
+    BIO_HTTP2:
+      off/false/0/no  -> HTTP/1.1
+      on/true/1/yes   -> HTTP/2 if installed, else HTTP/1.1
+      auto (default)  -> HTTP/2 only if 'h2' is installed
     """
     mode = (os.getenv("BIO_HTTP2", "auto") or "").lower()
     if mode in ("off", "false", "0", "no"):
@@ -33,11 +34,11 @@ def _http2_enabled() -> bool:
         return _H2_AVAILABLE
     return _H2_AVAILABLE
 
-# -------------------- SPARQL transport --------------------
+# -------------------- Robust SPARQL transport --------------------
 async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) -> Dict[str, Any]:
     """
-    Execute a SPARQL query expecting a JSON result (SELECT/ASK).
-    Robust fallback matrix:
+    Execute SPARQL expecting JSON (SELECT/ASK).
+    Fallback matrix:
       1) POST (no format)
       2) POST (format=json)
       3) GET  (no format)
@@ -45,7 +46,6 @@ async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) ->
     """
     use_h2 = _http2_enabled()
     t = httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=10.0)
-
     accept = "application/sparql-results+json"
     headers_post = {"Accept": accept, "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"}
     headers_get  = {"Accept": accept, "User-Agent": UA}
@@ -70,26 +70,18 @@ async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) ->
                 return {"error": {"status_code": r.status_code, "body": (r.text or "")[:2000]}}
             return r.json()
 
-    attempts = [
-        _do_post(False),
-        _do_post(True),
-        _do_get(False),
-        _do_get(True),
-    ]
-
-    # Try each transport/format combo in order; stop on first non-error JSON
+    attempts = [_do_post(False), _do_post(True), _do_get(False), _do_get(True)]
     for coro in attempts:
         try:
             res = await coro
             if "error" not in res:
                 return res
         except (httpx.TimeoutException, httpx.TransportError):
-            # try next attempt
             continue
 
     return {"error": {"status_code": 599, "body": "All SPARQL attempts failed"}}
 
-# -------------------- Tools --------------------
+# -------------------- Tools (NL→SPARQL execution) --------------------
 @mcp.tool(
     name="execute_sparql_rhea",
     description=(
@@ -97,27 +89,19 @@ async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) ->
         "YOU (the AI) MUST convert the user's natural-language request into SPARQL.\n"
         "Contract:\n"
         "  • Use SELECT or ASK only (JSON results expected).\n"
-        "  • Prefer these prefixes:\n"
+        "  • Prefer:\n"
         "      PREFIX rh:   <http://rdf.rhea-db.org/>\n"
         "      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
-        "  • Reaction classes are rdfs:subClassOf rh:Reaction.\n"
-        "  • Reaction accession is rh:accession; human-readable equation is rdfs:label.\n"
-        "  • For text search, use LCASE/CONTAINS on STR(?eq) and/or STR(?acc).\n"
-        "  • Always include a LIMIT.\n"
-        "  • Escape double quotes in string literals.\n\n"
-        "Return columns are up to you, but typical ones include ?id ?acc ?eq.\n"
-        "If the user asks for counts, use COUNT(*). If yes/no, use ASK.\n"
-        "If the user asks for a specific Rhea accession, match it via rh:accession.\n"
+        "  • Reaction classes: rdfs:subClassOf rh:Reaction\n"
+        "  • Accession: rh:accession; equation text: rdfs:label\n"
+        "  • For text search: LCASE/CONTAINS on STR(?eq)/STR(?acc)\n"
+        "  • Always include a LIMIT; escape double-quotes in strings."
     )
 )
 async def execute_sparql_rhea(query_string: str, timeout: float = 60.0) -> Dict[str, Any]:
-    """
-    Execute caller-provided SPARQL (SELECT/ASK) and return JSON results.
-    """
     s = (query_string or "").strip()
     if not s:
         return {"error": "Empty SPARQL query."}
-    # Very light guardrails: discourage CONSTRUCT/DESCRIBE to keep JSON contract.
     if re.search(r"\b(CONSTRUCT|DESCRIBE)\b", s, flags=re.IGNORECASE):
         return {"error": "Use SELECT or ASK for JSON results."}
     return await _exec_sparql_json(RHEA_SPARQL, s, timeout=timeout)
@@ -152,15 +136,54 @@ async def fetch(id: str, language: str = "en"):
 
 @mcp.tool(
     name="debug_ping",
-    description="Simple SELECT 1 check and transport info for the Rhea endpoint."
+    description="Simple SELECT 1 and transport info."
 )
 async def debug_ping():
     use_h2 = _http2_enabled()
     rh = await _exec_sparql_json(RHEA_SPARQL, "SELECT (1 AS ?x) WHERE {}", timeout=10.0)
     return {"rhea": rh, "http2_enabled": use_h2, "h2_installed": _H2_AVAILABLE}
 
-# -------------------- ASGI app --------------------
-app = mcp.streamable_http_app()
+# -------------------- ASGI app (root-friendly) --------------------
+# The MCP SSE endpoint is at "/". Some clients probe "/" without SSE.
+# Wrap the SSE app so:
+#   - If Accept: text/event-stream  -> hand off to MCP SSE
+#   - Otherwise                      -> return 200 health text (no 400s)
+sse_app = mcp.streamable_http_app()
+
+async def _plain_200(scope, receive, send, body: str = "MCP server OK (root)."):
+    headers = [
+        (b"content-type", b"text/plain; charset=utf-8"),
+        (b"cache-control", b"no-store"),
+        (b"access-control-allow-origin", b"*"),
+    ]
+    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    await send({"type": "http.response.body", "body": body.encode("utf-8"), "more_body": False})
+
+class RootOrSSE:
+    def __init__(self, sse):
+        self.sse = sse
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.sse(scope, receive, send)
+
+        path = scope.get("path", "/") or "/"
+        # Normalize headers
+        hdrs = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        accept = hdrs.get("accept", "")
+
+        # Health endpoint
+        if path == "/healthz":
+            return await _plain_200(scope, receive, send, "ok")
+
+        # MCP SSE handshake if client asks for event-stream
+        if "text/event-stream" in accept:
+            return await self.sse(scope, receive, send)
+
+        # Otherwise, return a friendly 200 (prevents spurious 400s on reachability checks)
+        return await _plain_200(scope, receive, send)
+
+app = RootOrSSE(sse_app)
 
 if __name__ == "__main__":
     import uvicorn
