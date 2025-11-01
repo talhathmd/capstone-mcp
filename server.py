@@ -1,13 +1,13 @@
-# server.py — Rhea-only MCP, root "/" only
+# server.py — Rhea-only MCP for NL→SPARQL:
 import os
 import re
 import asyncio
-from typing import Dict, List
+from typing import Any, Dict
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 RHEA_SPARQL = os.getenv("RHEA_SPARQL", "https://sparql.rhea-db.org/sparql")
-UA          = os.getenv("BIO_UA", "GraphBio-RheaOnly/1.3 (contact: you@example.com)")
+UA          = os.getenv("BIO_UA", "GraphBio-RheaOnly/2.0 (contact: you@example.com)")
 
 mcp = FastMCP("graph-bio-rhea")
 mcp.settings.streamable_http_path = "/"  # MCP lives at root
@@ -21,7 +21,7 @@ except Exception:
 
 def _http2_enabled() -> bool:
     """
-    HTTP/2 policy controlled by BIO_HTTP2 env:
+    BIO_HTTP2 env:
       - off/false/0/no  -> force HTTP/1.1
       - on/true/1/yes   -> use HTTP/2 if installed, else HTTP/1.1
       - auto (default)  -> use HTTP/2 only if 'h2' is installed
@@ -31,173 +31,100 @@ def _http2_enabled() -> bool:
         return False
     if mode in ("on", "true", "1", "yes"):
         return _H2_AVAILABLE
-    return _H2_AVAILABLE  # auto
+    return _H2_AVAILABLE
 
-# -------------------- Query helpers --------------------
-_MAX_TOKENS = 6
-_MAX_TOKEN_LEN = 64
-
-def _sparql_str(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
-
-def _nl_tokens(q: str) -> List[str]:
+# -------------------- SPARQL transport --------------------
+async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) -> Dict[str, Any]:
     """
-    Safe tokenization:
-      - letters/digits/_/+/- only
-      - drop tokens <= 2 chars
-      - lowercase
-      - cap length and total count
+    Execute a SPARQL query expecting a JSON result (SELECT/ASK).
+    Robust fallback matrix:
+      1) POST (no format)
+      2) POST (format=json)
+      3) GET  (no format)
+      4) GET  (format=json)
     """
-    toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9_+-]+", q or "")
-    toks = [t.lower()[:_MAX_TOKEN_LEN] for t in toks if len(t) >= 3]
-    out, seen = [], set()
-    for t in toks:
-        if t not in seen:
-            seen.add(t); out.append(t)
-        if len(out) >= _MAX_TOKENS:
-            break
-    return out
-
-# -------------------- HTTP/SPARQL core --------------------
-async def _post_sparql(
-    endpoint: str,
-    query: str,
-    timeout: float = 60.0,
-    retries: int = 2,
-    prefer_get_fallback: bool = True,
-) -> Dict:
-    """
-    POST SPARQL with optional GET fallback, exponential backoff.
-    Uses HTTP/2 iff available/configured; always includes format=json.
-    """
-    headers_post = {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    headers_get = {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": UA,
-    }
-
-    t = httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=10.0)
-    backoff = 0.75
     use_h2 = _http2_enabled()
+    t = httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=10.0)
 
-    async def _try_post():
+    accept = "application/sparql-results+json"
+    headers_post = {"Accept": accept, "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"}
+    headers_get  = {"Accept": accept, "User-Agent": UA}
+
+    async def _do_post(with_format: bool):
+        data = {"query": query}
+        if with_format:
+            data["format"] = "json"
         async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=use_h2) as client:
-            r = await client.post(endpoint, data={"query": query, "format": "json"}, headers=headers_post)
+            r = await client.post(endpoint, data=data, headers=headers_post)
             if r.status_code >= 400:
                 return {"error": {"status_code": r.status_code, "body": (r.text or "")[:2000]}}
             return r.json()
 
-    async def _try_get():
+    async def _do_get(with_format: bool):
+        params = {"query": query}
+        if with_format:
+            params["format"] = "json"
         async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=use_h2) as client:
-            r = await client.get(endpoint, params={"query": query, "format": "json"}, headers=headers_get)
+            r = await client.get(endpoint, params=params, headers=headers_get)
             if r.status_code >= 400:
                 return {"error": {"status_code": r.status_code, "body": (r.text or "")[:2000]}}
             return r.json()
 
-    for _ in range(retries + 1):
+    attempts = [
+        _do_post(False),
+        _do_post(True),
+        _do_get(False),
+        _do_get(True),
+    ]
+
+    # Try each transport/format combo in order; stop on first non-error JSON
+    for coro in attempts:
         try:
-            return await _try_post()
+            res = await coro
+            if "error" not in res:
+                return res
         except (httpx.TimeoutException, httpx.TransportError):
-            await asyncio.sleep(backoff)
-            backoff *= 2
+            # try next attempt
+            continue
 
-    if prefer_get_fallback:
-        try:
-            return await _try_get()
-        except (httpx.TimeoutException, httpx.TransportError) as e2:
-            return {"error": {"status_code": 599, "body": f"GET fallback {type(e2).__name__}: {e2}"}}
-    return {"error": {"status_code": 599, "body": "SPARQL POST failed and GET not attempted"}}
+    return {"error": {"status_code": 599, "body": "All SPARQL attempts failed"}}
 
-# -------------------- Rhea label search --------------------
-def _build_rhea_label_query(q: str, limit: int) -> str:
-    """
-    Match tokens against rdfs:label (equation) OR rh:accession; AND across tokens.
-    """
-    tokens = _nl_tokens(q)
-    token_filter = "\n".join(
-        f'  FILTER(CONTAINS(LCASE(STR(?eq)), "{_sparql_str(t)}") '
-        f'      OR CONTAINS(LCASE(STR(?acc)), "{_sparql_str(t)}"))'
-        for t in tokens
-    ) or "  # no tokens; return limited results\n"
-
-    return f"""
-PREFIX rh:   <http://rdf.rhea-db.org/>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?id ?acc ?eq WHERE {{
-  ?id rdfs:subClassOf rh:Reaction ;
-      rh:accession ?acc ;
-      rdfs:label ?eq .
-{token_filter}
-}}
-ORDER BY ?acc
-LIMIT {int(limit)}
-""".strip()
-
-async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict]:
-    q = _build_rhea_label_query(needle, limit)
-    data = await _post_sparql(RHEA_SPARQL, q)
-    if "error" in data:
-        return [{
-            "type": "error",
-            "id": "rhea",
-            "title": "Rhea SPARQL error",
-            "snippet": f"{data['error'].get('status_code')} — {data['error'].get('body','')[:160]}",
-            "url": RHEA_SPARQL,
-            "source": "rhea",
-        }]
-    out: List[Dict] = []
-    for b in data.get("results", {}).get("bindings", []):
-        iri = b["id"]["value"]
-        acc = b.get("acc", {}).get("value", "")
-        eq  = b.get("eq", {}).get("value", "")
-        title = f"{acc} — {eq[:160]}"
-        out.append({
-            "type": "rhea:reaction",
-            "id": iri, "title": title, "snippet": "Rhea reaction",
-            "url": iri, "source": "rhea"
-        })
-    return out
-
-# -------------------- Public tools --------------------
+# -------------------- Tools --------------------
 @mcp.tool(
-    name="search",
-    description="Search Rhea reactions by label (equation) or accession."
+    name="execute_sparql_rhea",
+    description=(
+        "Run a SPARQL query against the Rhea SPARQL endpoint.\n\n"
+        "YOU (the AI) MUST convert the user's natural-language request into SPARQL.\n"
+        "Contract:\n"
+        "  • Use SELECT or ASK only (JSON results expected).\n"
+        "  • Prefer these prefixes:\n"
+        "      PREFIX rh:   <http://rdf.rhea-db.org/>\n"
+        "      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+        "  • Reaction classes are rdfs:subClassOf rh:Reaction.\n"
+        "  • Reaction accession is rh:accession; human-readable equation is rdfs:label.\n"
+        "  • For text search, use LCASE/CONTAINS on STR(?eq) and/or STR(?acc).\n"
+        "  • Always include a LIMIT.\n"
+        "  • Escape double quotes in string literals.\n\n"
+        "Return columns are up to you, but typical ones include ?id ?acc ?eq.\n"
+        "If the user asks for counts, use COUNT(*). If yes/no, use ASK.\n"
+        "If the user asks for a specific Rhea accession, match it via rh:accession.\n"
+    )
 )
-async def search(query: str, limit: int = 10, language: str = "en", source: str = "rhea"):
+async def execute_sparql_rhea(query_string: str, timeout: float = 60.0) -> Dict[str, Any]:
     """
-    Understands free text and Rhea accessions. 'source' is accepted for compatibility but ignored.
+    Execute caller-provided SPARQL (SELECT/ASK) and return JSON results.
     """
-    s = (query or "").strip()
-
-    # Exact accession: RHEA:<digits>
-    m = re.fullmatch(r"(?i)RHEA:(\d+)", s)
-    if m:
-        rid = m.group(1)
-        iri = f"https://rdf.rhea-db.org/{rid}"
-        return {"results": [{
-            "type": "rhea:reaction", "id": iri, "title": f"RHEA:{rid}",
-            "snippet": "Rhea reaction", "url": iri, "source": "rhea"
-        }][:limit]}
-
-    # Free-text label search
-    results = await _search_rhea_labels(s, limit=limit)
-
-    ok = [r for r in results if r.get("type") != "error"]
-    out: Dict = {"results": ok[:limit]}
-    errs = [r for r in results if r.get("type") == "error"]
-    if errs:
-        out["errors"] = [{
-            "source": e.get("id"), "message": e.get("snippet"), "endpoint": e.get("url")
-        } for e in errs]
-    return out
+    s = (query_string or "").strip()
+    if not s:
+        return {"error": "Empty SPARQL query."}
+    # Very light guardrails: discourage CONSTRUCT/DESCRIBE to keep JSON contract.
+    if re.search(r"\b(CONSTRUCT|DESCRIBE)\b", s, flags=re.IGNORECASE):
+        return {"error": "Use SELECT or ASK for JSON results."}
+    return await _exec_sparql_json(RHEA_SPARQL, s, timeout=timeout)
 
 @mcp.tool(
     name="fetch",
-    description="Fetch raw content for a Rhea accession or an HTTP(S) URL."
+    description="Fetch raw content for a Rhea accession (RHEA:<digits>) or an HTTP(S) URL."
 )
 async def fetch(id: str, language: str = "en"):
     s = (id or "").strip()
@@ -229,7 +156,7 @@ async def fetch(id: str, language: str = "en"):
 )
 async def debug_ping():
     use_h2 = _http2_enabled()
-    rh = await _post_sparql(RHEA_SPARQL, "SELECT (1 AS ?x) WHERE {}", timeout=10.0, retries=0)
+    rh = await _exec_sparql_json(RHEA_SPARQL, "SELECT (1 AS ?x) WHERE {}", timeout=10.0)
     return {"rhea": rh, "http2_enabled": use_h2, "h2_installed": _H2_AVAILABLE}
 
 # -------------------- ASGI app --------------------
