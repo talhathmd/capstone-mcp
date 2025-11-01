@@ -212,8 +212,8 @@ async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, An
 async def search(query: str, limit: int = 10, language: str = "en", source: str = "both"):
     results: List[Dict[str, Any]] = []
     src = (source or "both").lower()
-    if src in ("uniprot", "both", "all"):
-        results += await _search_uniprot_labels(query, limit=limit)
+    # if src in ("uniprot", "both", "all"):
+    #     results += await _search_uniprot_labels(query, limit=limit)
     if src in ("rhea", "both", "all"):
         results += await _search_rhea_labels(query, limit=limit)
     errors, ok = [], []
