@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 UNIPROT = os.getenv("UNIPROT_SPARQL", "https://sparql.uniprot.org/sparql")
 RHEA    = os.getenv("RHEA_SPARQL",    "https://sparql.rhea-db.org/sparql")
-UA      = os.getenv("BIO_UA", "TalhaCapstone/0.8 (contact: you@example.com)")
+UA      = os.getenv("BIO_UA", "GraphBio/1.0 (contact: you@example.com)")
 
 mcp = FastMCP("graph-bio")
 mcp.settings.streamable_http_path = "/"  # MCP lives at root
@@ -24,7 +24,7 @@ def _nl_tokens(q: str) -> List[str]:
     """
     Tokenize safely:
       - letters/digits/_/-
-      - drop very short tokens (<=2) like 'A'
+      - drop very short tokens (<=2)
       - lowercase for case-insensitive matching
     """
     toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", q or "")
@@ -37,9 +37,9 @@ def _nl_tokens(q: str) -> List[str]:
 
 def _build_uniprot_text_query_free(q: str, limit: int) -> str:
     """
-    Free-text search WITHOUT hardcoding taxa:
+    Free-text search without hardcoding taxonomy:
       - Prefer recommendedName then rdfs:label then mnemonic as ?label
-      - OPTIONAL organism join; match tokens against protein label OR organism label
+      - Optional organism join; match tokens against protein label OR organism label
       - AND all tokens
     """
     tokens = _nl_tokens(q)
@@ -61,7 +61,8 @@ SELECT ?id ?acc ?label ?orgLabel WHERE {{
 
   OPTIONAL {{
     ?id up:organism ?org .
-    OPTIONAL {{ ?org rdfs:label ?orgLabel . FILTER(LANG(?orgLabel) = "" || LANGMATCHES(LANG(?orgLabel), "en")) }}
+    OPTIONAL {{ ?org rdfs:label ?orgLabel .
+               FILTER(LANG(?orgLabel) = "" || LANGMATCHES(LANG(?orgLabel), "en")) }}
   }}
 
   BIND(LCASE(STR(?label)) AS ?lcLabel)
@@ -82,8 +83,7 @@ async def _post_sparql(
     force_http1: bool = True,
 ) -> Dict[str, Any]:
     """
-    POST SPARQL with fallback to GET (for networks/proxies that block POST bodies),
-    and optionally force HTTP/1.1 to avoid HTTP/2 quirks on some platforms.
+    POST SPARQL with fallback to GET; optionally force HTTP/1.1.
     """
     headers = {
         "Accept": "application/sparql-results+json",
@@ -91,7 +91,6 @@ async def _post_sparql(
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    # Make httpx happy: specify all four timeouts explicitly (incl. pool)
     t = httpx.Timeout(connect=10.0, read=timeout, write=20.0, pool=10.0)
     backoff = 0.75
 
@@ -128,15 +127,12 @@ async def _post_sparql(
 
 @mcp.tool()
 async def execute_sparql_uniprot(query_string: str, format: str = "json") -> Dict[str, Any]:
-    """Run a SPARQL query against the UniProt endpoint.
-    Hints: For species, join via up:organism / rdfs:label instead of hardcoding taxonomy IDs.
-    Use exact equality on up:mnemonic for symbols like EGFR_HUMAN (avoid LCASE() on mnemonic)."""
+    """Run a SPARQL query against the UniProt endpoint."""
     return await _post_sparql(UNIPROT, query_string, timeout=60.0)
-
-
 
 @mcp.tool()
 async def execute_sparql_rhea(query_string: str, format: str = "json") -> Dict[str, Any]:
+    """Run a SPARQL query against the Rhea endpoint."""
     return await _post_sparql(RHEA, query_string, timeout=60.0)
 
 # -------------------- Label search builders --------------------
@@ -177,6 +173,7 @@ SELECT ?id ?acc ?eq WHERE {
 ORDER BY ?acc
 LIMIT %d
 """
+
 MNEMONIC_EQ_Q = """
 PREFIX up: <http://purl.uniprot.org/core/>
 SELECT ?id ?acc WHERE {
@@ -188,13 +185,12 @@ LIMIT %d
 
 def _is_mnemonic_like(s: str) -> bool:
     """
-    Heuristic: short, no spaces, letters/digits/hyphens/underscores.
-    Covers typical protein symbols (EGFR, BRCA1) and mnemonics (EGFR_HUMAN).
+    Heuristic for compact, no-space tokens (letters/digits/_/-).
     """
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{3,20}", s or ""))
 
 async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
-    # 1) Fast path: exact mnemonic equality (index-friendly, no LCASE)
+    # 1) Exact mnemonic equality (index-friendly)
     if _is_mnemonic_like(needle):
         q_fast = MNEMONIC_EQ_Q % (_sparql_str(needle), limit)
         data_fast = await _post_sparql(UNIPROT, q_fast, timeout=90.0)
@@ -212,9 +208,9 @@ async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str,
                 return out_fast
         # fall through if no hits
 
-    # 2) Free-text across protein label + organism label (no taxon hardcoding)
+    # 2) Free-text across protein and organism labels
     q_text = _build_uniprot_text_query_free(needle, limit)
-    data = await _post_sparql(UNIPROT, q_text, timeout=90.0)  # UniProt can be slow
+    data = await _post_sparql(UNIPROT, q_text, timeout=90.0)
 
     if "error" in data:
         return [{
@@ -236,7 +232,6 @@ async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str,
     return out
 
 
-
 async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
     q = RHEA_LABEL_SEARCH % (_sparql_str(needle), limit)
     data = await _post_sparql(RHEA, q)
@@ -255,23 +250,84 @@ async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, An
         acc = b.get("acc", {}).get("value", "")
         eq  = b.get("eq", {}).get("value", "")
         title = f"{acc} — {eq[:160]}"
-        out.append({"type": "rhea:reaction", "id": iri, "title": title, "snippet": "Rhea reaction", "url": iri, "source": "rhea"})
+        out.append({
+            "type": "rhea:reaction",
+            "id": iri, "title": title, "snippet": "Rhea reaction",
+            "url": iri, "source": "rhea"
+        })
     return out
 
 # -------------------- Public search/fetch --------------------
 
-@mcp.tool(name="search", description="Organism-aware free-text search for UniProt and/or Rhea by label or ID. Accepts queries like 'lactate dehydrogenase A Homo sapiens'.")
+@mcp.tool(
+    name="search",
+    description=(
+        "Searchs knowledge graphs by label or identifier. "
+        "Supports UniProt proteins and Rhea reactions. "
+        "Understands free-text queries as well as accessions and mnemonics. "
+        "Use 'source' to target 'uniprot', 'rhea', or 'both' (default)."
+    )
+)
 async def search(query: str, limit: int = 10, language: str = "en", source: str = "both"):
-    results: List[Dict[str, Any]] = []
+    """
+    Behavior:
+      1) Route exact IDs immediately:
+         - Rhea accessions (RHEA:<digits>)
+         - UniProt accessions (6–10 chars, optional isoform suffix)
+         - UniProt mnemonics (compact tokens with underscore)
+      2) Otherwise, run label searches based on 'source':
+         - uniprot | rhea | both
+    """
     src = (source or "both").lower()
-    # if src in ("uniprot", "both", "all"):
-    #     results += await _search_uniprot_labels(query, limit=limit)
+    s = (query or "").strip()
+    results: List[Dict[str, Any]] = []
+
+    # --- 1) Exact routing by ID-like inputs ---
+    m_rhea = re.fullmatch(r"(?i)RHEA:(\d+)", s)
+    if m_rhea:
+        rhea_iri = f"https://rdf.rhea-db.org/{m_rhea.group(1)}"
+        results.append({
+            "type": "rhea:reaction",
+            "id": rhea_iri,
+            "title": f"RHEA:{m_rhea.group(1)}",
+            "snippet": "Rhea reaction",
+            "url": rhea_iri,
+            "source": "rhea"
+        })
+        return {"results": results[:limit]}
+
+    if re.fullmatch(r"[A-NR-Z0-9]{6,10}(?:-\d+)?", s):
+        up_iri = f"https://purl.uniprot.org/uniprot/{s}"
+        results.append({
+            "type": "uniprot:protein",
+            "id": up_iri,
+            "title": s,
+            "snippet": "UniProtKB protein (accession)",
+            "url": up_iri,
+            "source": "uniprot"
+        })
+        return {"results": results[:limit]}
+
+    if _is_mnemonic_like(s) and "_" in s:
+        fast_hits = await _search_uniprot_labels(s, limit=limit)
+        if fast_hits:
+            return {"results": fast_hits[:limit]}
+
+    # --- 2) Label search based on source ---
+    if src in ("uniprot", "both", "all"):
+        results += await _search_uniprot_labels(s, limit=limit)
     if src in ("rhea", "both", "all"):
-        results += await _search_rhea_labels(query, limit=limit)
+        results += await _search_rhea_labels(s, limit=limit)
+
+    # Aggregate + dedupe + surface errors
     errors, ok = [], []
     for r in results:
         if r.get("type") == "error":
-            errors.append({"source": r.get("id"), "message": r.get("snippet"), "endpoint": r.get("url")})
+            errors.append({
+                "source": r.get("id"),
+                "message": r.get("snippet"),
+                "endpoint": r.get("url")
+            })
         else:
             ok.append(r)
     seen = set()
@@ -281,10 +337,18 @@ async def search(query: str, limit: int = 10, language: str = "en", source: str 
         if rid and rid not in seen:
             seen.add(rid); dedup.append(r)
     out: Dict[str, Any] = {"results": dedup[:limit]}
-    if errors: out["errors"] = errors
+    if errors:
+        out["errors"] = errors
     return out
 
-@mcp.tool(name="fetch", description="Fetch content by URL, UniProt accession, or RHEA:<id>.")
+@mcp.tool(
+    name="fetch",
+    description=(
+        "Fetch content for a given identifier or URL. "
+        "Accepts Rhea accessions (RHEA:<digits>), UniProt accessions (with optional isoform), "
+        "or HTTP(S) URLs."
+    )
+)
 async def fetch(id: str, language: str = "en"):
     s = (id or "").strip()
     if re.match(r"^https?://", s, re.IGNORECASE):
@@ -311,7 +375,7 @@ async def fetch(id: str, language: str = "en"):
             return {"id": s, "url": iri, "mime": r.headers.get("content-type"), "content": r.text[:200000]}
         except Exception as e:
             return {"error": f"Fetch failed for UniProt accession: {e}"}
-    return {"error": "Pass a URL, a UniProt accession (e.g., P00533 or P00533-2), or a Rhea ID like RHEA:12345."}
+    return {"error": "Provide a URL, a UniProt accession, or a Rhea accession."}
 
 # -------------------- Endpoint chooser --------------------
 
@@ -324,18 +388,21 @@ BIO_HINTS_RHEA = (
     "stoichiometry", "reversible", "irreversible",
 )
 
-@mcp.tool(name="choose_endpoint", description="Return the best KG: 'uniprot'|'rhea'.")
+@mcp.tool(
+    name="choose_endpoint",
+    description="Suggests 'uniprot' or 'rhea' based on lexical cues in a natural-language question."
+)
 async def choose_endpoint(question: str) -> Dict[str, Any]:
     q = (question or "").lower()
     if any(k in q for k in BIO_HINTS_RHEA):
-        return {"target": "rhea", "reason": "biochemical reaction cues detected"}
+        return {"target": "rhea", "reason": "reaction-related cues detected"}
     if any(k in q for k in BIO_HINTS_UNIPROT):
-        return {"target": "uniprot", "reason": "protein/enzyme cues detected"}
+        return {"target": "uniprot", "reason": "protein-related cues detected"}
     return {"target": "uniprot", "reason": "default fallback"}
 
 # -------------------- Diagnostics --------------------
 
-@mcp.tool(name="debug_ping", description="Quick endpoint health-check with a trivial SELECT 1.")
+@mcp.tool(name="debug_ping", description="Simple SELECT 1 checks for both endpoints.")
 async def debug_ping():
     up = await _post_sparql(UNIPROT, "SELECT (1 AS ?x) WHERE {}", timeout=10.0, retries=0)
     rh = await _post_sparql(RHEA,   "SELECT (1 AS ?x) WHERE {}", timeout=10.0, retries=0)
@@ -346,5 +413,5 @@ async def debug_ping():
 app = mcp.streamable_http_app()
 
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
