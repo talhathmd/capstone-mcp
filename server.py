@@ -4,50 +4,53 @@ import re
 import asyncio
 from typing import Any, Dict, List
 import httpx
-from functools import lru_cache
 from mcp.server.fastmcp import FastMCP
 
 UNIPROT = os.getenv("UNIPROT_SPARQL", "https://sparql.uniprot.org/sparql")
 RHEA    = os.getenv("RHEA_SPARQL",    "https://sparql.rhea-db.org/sparql")
-UA      = os.getenv("BIO_UA", "GraphBio/1.0 (contact: you@example.com)")
+UA      = os.getenv("BIO_UA", "GraphBio/1.1 (contact: you@example.com)")
 
 mcp = FastMCP("graph-bio")
 mcp.settings.streamable_http_path = "/"  # MCP lives at root
 
 # -------------------- Helpers --------------------
 
-def _sparql_str(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+_MAX_TOKENS = 6            # avoid huge WHEREs
+_MAX_TOKEN_LEN = 64        # avoid pathological very-long tokens
 
+def _sparql_str(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
 
 def _nl_tokens(q: str) -> List[str]:
     """
     Tokenize safely:
       - letters/digits/_/-
-      - drop very short tokens (<=2)
-      - lowercase for case-insensitive matching
+      - drop short tokens (<=2)
+      - downcase
+      - cap count/length
     """
     toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", q or "")
-    toks = [t.lower() for t in toks if len(t) >= 3]
-    seen = set(); out = []
+    toks = [t.lower()[:_MAX_TOKEN_LEN] for t in toks if len(t) >= 3]
+    # dedupe preserving order
+    seen = set()
+    out = []
     for t in toks:
         if t not in seen:
             seen.add(t); out.append(t)
+        if len(out) >= _MAX_TOKENS:
+            break
     return out
 
-def _build_uniprot_text_query_free(q: str, limit: int) -> str:
+def _build_uniprot_text_query_full(q: str, limit: int) -> str:
     """
-    Free-text search without hardcoding taxonomy:
-      - Prefer recommendedName then rdfs:label then mnemonic as ?label
-      - Optional organism join; match tokens against protein label OR organism label
-      - AND all tokens
+    Free-text search with optional organism join.
+    AND across tokens; match against protein label OR organism label.
     """
     tokens = _nl_tokens(q)
-
     token_filters = "\n".join(
         f'  FILTER(CONTAINS(?lcLabel, "{_sparql_str(t)}") OR CONTAINS(?lcOrg, "{_sparql_str(t)}"))'
         for t in tokens
-    ) or "  # no usable tokens; returning limited results\n"
+    ) or "  # no tokens; return limited results\n"
 
     return f"""
 PREFIX up:   <http://purl.uniprot.org/core/>
@@ -61,8 +64,10 @@ SELECT ?id ?acc ?label ?orgLabel WHERE {{
 
   OPTIONAL {{
     ?id up:organism ?org .
-    OPTIONAL {{ ?org rdfs:label ?orgLabel .
-               FILTER(LANG(?orgLabel) = "" || LANGMATCHES(LANG(?orgLabel), "en")) }}
+    OPTIONAL {{
+      ?org rdfs:label ?orgLabel .
+      FILTER(LANG(?orgLabel) = "" || LANGMATCHES(LANG(?orgLabel), "en"))
+    }}
   }}
 
   BIND(LCASE(STR(?label)) AS ?lcLabel)
@@ -73,6 +78,34 @@ ORDER BY ?label
 LIMIT {int(limit)}
 """.strip()
 
+def _build_uniprot_text_query_minimal(q: str, limit: int) -> str:
+    """
+    Simpler fallback: no organism join, fewer OPTIONALs.
+    AND across tokens; match protein label or mnemonic.
+    """
+    tokens = _nl_tokens(q)
+    token_filters = "\n".join(
+        f'  FILTER(CONTAINS(?lcLabel, "{_sparql_str(t)}") OR CONTAINS(?lcAcc, "{_sparql_str(t)}"))'
+        for t in tokens
+    ) or "  # no tokens; return limited results\n"
+
+    return f"""
+PREFIX up:   <http://purl.uniprot.org/core/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?id ?acc ?label WHERE {{
+  ?id a up:Protein .
+  OPTIONAL {{ ?id up:mnemonic ?acc . }}
+  OPTIONAL {{ ?id up:recommendedName/up:fullName ?rn . }}
+  OPTIONAL {{ ?id rdfs:label ?rl . }}
+  BIND(COALESCE(?rn, ?rl, ?acc) AS ?label)
+
+  BIND(LCASE(STR(?label)) AS ?lcLabel)
+  BIND(LCASE(STR(COALESCE(?acc, ""))) AS ?lcAcc)
+{token_filters}
+}}
+ORDER BY ?label
+LIMIT {int(limit)}
+""".strip()
 
 async def _post_sparql(
     endpoint: str,
@@ -80,48 +113,56 @@ async def _post_sparql(
     timeout: float = 60.0,
     retries: int = 2,
     prefer_get_fallback: bool = True,
-    force_http1: bool = True,
+    force_http1: bool = False,   # prefer HTTP/2; some gateways behave better
 ) -> Dict[str, Any]:
     """
-    POST SPARQL with fallback to GET; optionally force HTTP/1.1.
+    POST SPARQL with fallback to GET (and format hint), exponential backoff,
+    and HTTP/2 by default.
     """
-    headers = {
+    headers_post = {
         "Accept": "application/sparql-results+json",
         "User-Agent": UA,
         "Content-Type": "application/x-www-form-urlencoded",
     }
+    headers_get = {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": UA,
+    }
 
-    t = httpx.Timeout(connect=10.0, read=timeout, write=20.0, pool=10.0)
+    t = httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=10.0)
     backoff = 0.75
 
     async def _try_post():
         async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=not force_http1) as client:
-            r = await client.post(endpoint, data={"query": query}, headers=headers)
+            # add 'format=json' which some proxies/gateways prefer
+            r = await client.post(endpoint, data={"query": query, "format": "json"}, headers=headers_post)
             if r.status_code >= 400:
-                return {"error": {"status_code": r.status_code, "body": r.text[:2000]}}
+                return {"error": {"status_code": r.status_code, "body": (r.text or "")[:2000]}}
             return r.json()
 
     async def _try_get():
-        hdrs = {k: v for k, v in headers.items() if k != "Content-Type"}
         async with httpx.AsyncClient(timeout=t, follow_redirects=True, http2=not force_http1) as client:
-            r = await client.get(endpoint, params={"query": query}, headers=hdrs)
+            r = await client.get(endpoint, params={"query": query, "format": "json"}, headers=headers_get)
             if r.status_code >= 400:
-                return {"error": {"status_code": r.status_code, "body": r.text[:2000]}}
+                return {"error": {"status_code": r.status_code, "body": (r.text or "")[:2000]}}
             return r.json()
 
     for attempt in range(retries + 1):
         try:
             return await _try_post()
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            if attempt == retries:
-                if prefer_get_fallback:
-                    try:
-                        return await _try_get()
-                    except (httpx.TimeoutException, httpx.TransportError) as e2:
-                        return {"error": {"status_code": 599, "body": f"GET fallback {type(e2).__name__}: {e2}"}}
-                return {"error": {"status_code": 599, "body": f"POST {type(e).__name__}: {e}"}}
-            await asyncio.sleep(backoff)
-            backoff *= 2
+        except (httpx.TimeoutException, httpx.TransportError):
+            # transport failure; try again/backoff
+            pass
+        await asyncio.sleep(backoff)
+        backoff *= 2
+
+    # exhausted POST attempts; try GET once (classic corporate proxies)
+    if prefer_get_fallback:
+        try:
+            return await _try_get()
+        except (httpx.TimeoutException, httpx.TransportError) as e2:
+            return {"error": {"status_code": 599, "body": f"GET fallback {type(e2).__name__}: {e2}"}}
+    return {"error": {"status_code": 599, "body": "SPARQL POST failed and GET not attempted"}}
 
 # -------------------- Raw SPARQL tools --------------------
 
@@ -184,13 +225,13 @@ LIMIT %d
 """
 
 def _is_mnemonic_like(s: str) -> bool:
-    """
-    Heuristic for compact, no-space tokens (letters/digits/_/-).
-    """
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{3,20}", s or ""))
 
 async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
-    # 1) Exact mnemonic equality (index-friendly)
+    """
+    Try mnemonic equality -> full query -> minimal fallback if UniProt returns 400.
+    """
+    # 1) exact mnemonic equality (index-friendly)
     if _is_mnemonic_like(needle):
         q_fast = MNEMONIC_EQ_Q % (_sparql_str(needle), limit)
         data_fast = await _post_sparql(UNIPROT, q_fast, timeout=90.0)
@@ -206,11 +247,15 @@ async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str,
                 })
             if out_fast:
                 return out_fast
-        # fall through if no hits
+        # if error, just continue to robust path
 
-    # 2) Free-text across protein and organism labels
-    q_text = _build_uniprot_text_query_free(needle, limit)
-    data = await _post_sparql(UNIPROT, q_text, timeout=90.0)
+    # 2) full text+organism query
+    q_full = _build_uniprot_text_query_full(needle, limit)
+    data = await _post_sparql(UNIPROT, q_full, timeout=90.0)
+    if "error" in data and data["error"].get("status_code") == 400:
+        # 3) minimal fallback if their gateway rejects the full query
+        q_min = _build_uniprot_text_query_minimal(needle, limit)
+        data = await _post_sparql(UNIPROT, q_min, timeout=90.0)
 
     if "error" in data:
         return [{
@@ -230,7 +275,6 @@ async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str,
             "url": iri, "source": "uniprot"
         })
     return out
-
 
 async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
     q = RHEA_LABEL_SEARCH % (_sparql_str(needle), limit)
@@ -262,64 +306,53 @@ async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, An
 @mcp.tool(
     name="search",
     description=(
-        "Searchs knowledge graphs by label or identifier. "
-        "Supports UniProt proteins and Rhea reactions. "
-        "Understands free-text queries as well as accessions and mnemonics. "
-        "Use 'source' to target 'uniprot', 'rhea', or 'both' (default)."
+        "Searches UniProt proteins and Rhea reactions by label or identifier. "
+        "Understands free-text as well as compact identifiers; 'source' can be 'uniprot', 'rhea', or 'both' (default)."
     )
 )
 async def search(query: str, limit: int = 10, language: str = "en", source: str = "both"):
     """
     Behavior:
-      1) Route exact IDs immediately:
+      1) Exact-ID routing:
          - Rhea accessions (RHEA:<digits>)
          - UniProt accessions (6–10 chars, optional isoform suffix)
          - UniProt mnemonics (compact tokens with underscore)
-      2) Otherwise, run label searches based on 'source':
-         - uniprot | rhea | both
+      2) Otherwise, run label searches against selected source(s).
     """
     src = (source or "both").lower()
     s = (query or "").strip()
     results: List[Dict[str, Any]] = []
 
-    # --- 1) Exact routing by ID-like inputs ---
+    # --- 1) Exact routing ---
     m_rhea = re.fullmatch(r"(?i)RHEA:(\d+)", s)
     if m_rhea:
-        rhea_iri = f"https://rdf.rhea-db.org/{m_rhea.group(1)}"
-        results.append({
-            "type": "rhea:reaction",
-            "id": rhea_iri,
-            "title": f"RHEA:{m_rhea.group(1)}",
-            "snippet": "Rhea reaction",
-            "url": rhea_iri,
-            "source": "rhea"
-        })
-        return {"results": results[:limit]}
+        rid = m_rhea.group(1)
+        iri = f"https://rdf.rhea-db.org/{rid}"
+        return {"results": [{
+            "type": "rhea:reaction", "id": iri, "title": f"RHEA:{rid}",
+            "snippet": "Rhea reaction", "url": iri, "source": "rhea"
+        }][:limit]}
 
     if re.fullmatch(r"[A-NR-Z0-9]{6,10}(?:-\d+)?", s):
-        up_iri = f"https://purl.uniprot.org/uniprot/{s}"
-        results.append({
-            "type": "uniprot:protein",
-            "id": up_iri,
-            "title": s,
-            "snippet": "UniProtKB protein (accession)",
-            "url": up_iri,
-            "source": "uniprot"
-        })
-        return {"results": results[:limit]}
+        iri = f"https://purl.uniprot.org/uniprot/{s}"
+        return {"results": [{
+            "type": "uniprot:protein", "id": iri, "title": s,
+            "snippet": "UniProtKB protein (accession)", "url": iri, "source": "uniprot"
+        }][:limit]}
 
-    if _is_mnemonic_like(s) and "_" in s:
-        fast_hits = await _search_uniprot_labels(s, limit=limit)
-        if fast_hits:
-            return {"results": fast_hits[:limit]}
+    if "_" in s and re.fullmatch(r"[A-Za-z0-9_-]{3,20}", s or ""):
+        hits = await _search_uniprot_labels(s, limit=limit)
+        # if mnemonic equality or text finds something, return
+        if hits and all(h.get("type") != "error" for h in hits):
+            return {"results": hits[:limit]}
 
-    # --- 2) Label search based on source ---
+    # --- 2) Label searches ---
     if src in ("uniprot", "both", "all"):
         results += await _search_uniprot_labels(s, limit=limit)
     if src in ("rhea", "both", "all"):
         results += await _search_rhea_labels(s, limit=limit)
 
-    # Aggregate + dedupe + surface errors
+    # --- combine, dedupe, surface errors ---
     errors, ok = [], []
     for r in results:
         if r.get("type") == "error":
@@ -330,12 +363,14 @@ async def search(query: str, limit: int = 10, language: str = "en", source: str 
             })
         else:
             ok.append(r)
-    seen = set()
+
     dedup = []
+    seen = set()
     for r in ok:
         rid = r.get("id") or r.get("url")
         if rid and rid not in seen:
             seen.add(rid); dedup.append(r)
+
     out: Dict[str, Any] = {"results": dedup[:limit]}
     if errors:
         out["errors"] = errors
@@ -345,7 +380,7 @@ async def search(query: str, limit: int = 10, language: str = "en", source: str 
     name="fetch",
     description=(
         "Fetch content for a given identifier or URL. "
-        "Accepts Rhea accessions (RHEA:<digits>), UniProt accessions (with optional isoform), "
+        "Accepts Rhea accessions (RHEA:<digits>), UniProt accessions (with optional isoform suffix), "
         "or HTTP(S) URLs."
     )
 )
@@ -353,7 +388,7 @@ async def fetch(id: str, language: str = "en"):
     s = (id or "").strip()
     if re.match(r"^https?://", s, re.IGNORECASE):
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, http2=True) as client:
                 r = await client.get(s, headers={"User-Agent": UA})
             return {"id": s, "url": s, "mime": r.headers.get("content-type"), "content": r.text[:200000]}
         except Exception as e:
@@ -362,7 +397,7 @@ async def fetch(id: str, language: str = "en"):
     if m:
         iri = f"https://rdf.rhea-db.org/{m.group(1)}"
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, http2=True) as client:
                 r = await client.get(iri, headers={"User-Agent": UA})
             return {"id": s, "url": iri, "mime": r.headers.get("content-type"), "content": r.text[:200000]}
         except Exception as e:
@@ -370,7 +405,7 @@ async def fetch(id: str, language: str = "en"):
     if re.match(r"^[A-Z0-9]{6,10}(?:-\\d+)?$", s):
         iri = f"https://purl.uniprot.org/uniprot/{s}"
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, http2=True) as client:
                 r = await client.get(iri, headers={"User-Agent": UA})
             return {"id": s, "url": iri, "mime": r.headers.get("content-type"), "content": r.text[:200000]}
         except Exception as e:
