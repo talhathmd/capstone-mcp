@@ -19,6 +19,60 @@ mcp.settings.streamable_http_path = "/"  # MCP lives at root
 def _sparql_str(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
+
+def _nl_tokens(q: str) -> List[str]:
+    """
+    Tokenize safely:
+      - letters/digits/_/-
+      - drop very short tokens (<=2) like 'A'
+      - lowercase for case-insensitive matching
+    """
+    toks = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", q or "")
+    toks = [t.lower() for t in toks if len(t) >= 3]
+    seen = set(); out = []
+    for t in toks:
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def _build_uniprot_text_query_free(q: str, limit: int) -> str:
+    """
+    Free-text search WITHOUT hardcoding taxa:
+      - Prefer recommendedName then rdfs:label then mnemonic as ?label
+      - OPTIONAL organism join; match tokens against protein label OR organism label
+      - AND all tokens
+    """
+    tokens = _nl_tokens(q)
+
+    token_filters = "\n".join(
+        f'  FILTER(CONTAINS(?lcLabel, "{_sparql_str(t)}") OR CONTAINS(?lcOrg, "{_sparql_str(t)}"))'
+        for t in tokens
+    ) or "  # no usable tokens; returning limited results\n"
+
+    return f"""
+PREFIX up:   <http://purl.uniprot.org/core/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?id ?acc ?label ?orgLabel WHERE {{
+  ?id a up:Protein .
+  OPTIONAL {{ ?id up:mnemonic ?acc . }}
+  OPTIONAL {{ ?id up:recommendedName/up:fullName ?rn . }}
+  OPTIONAL {{ ?id rdfs:label ?rl . }}
+  BIND(COALESCE(?rn, ?rl, ?acc) AS ?label)
+
+  OPTIONAL {{
+    ?id up:organism ?org .
+    OPTIONAL {{ ?org rdfs:label ?orgLabel . FILTER(LANG(?orgLabel) = "" || LANGMATCHES(LANG(?orgLabel), "en")) }}
+  }}
+
+  BIND(LCASE(STR(?label)) AS ?lcLabel)
+  BIND(LCASE(STR(COALESCE(?orgLabel, ""))) AS ?lcOrg)
+{token_filters}
+}}
+ORDER BY ?label
+LIMIT {int(limit)}
+""".strip()
+
+
 async def _post_sparql(
     endpoint: str,
     query: str,
@@ -74,7 +128,12 @@ async def _post_sparql(
 
 @mcp.tool()
 async def execute_sparql_uniprot(query_string: str, format: str = "json") -> Dict[str, Any]:
+    """Run a SPARQL query against the UniProt endpoint.
+    Hints: For species, join via up:organism / rdfs:label instead of hardcoding taxonomy IDs.
+    Use exact equality on up:mnemonic for symbols like EGFR_HUMAN (avoid LCASE() on mnemonic)."""
     return await _post_sparql(UNIPROT, query_string, timeout=60.0)
+
+
 
 @mcp.tool()
 async def execute_sparql_rhea(query_string: str, format: str = "json") -> Dict[str, Any]:
@@ -135,54 +194,47 @@ def _is_mnemonic_like(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{3,20}", s or ""))
 
 async def _search_uniprot_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
-    # 1) Fast path for mnemonic-like tokens (index-friendly: exact equality, no LCASE)
+    # 1) Fast path: exact mnemonic equality (index-friendly, no LCASE)
     if _is_mnemonic_like(needle):
         q_fast = MNEMONIC_EQ_Q % (_sparql_str(needle), limit)
-        data_fast = await _post_sparql(UNIPROT, q_fast, timeout=90.0)  # give UniProt more read time
+        data_fast = await _post_sparql(UNIPROT, q_fast, timeout=90.0)
         if "error" not in data_fast:
             out_fast: List[Dict[str, Any]] = []
             for b in data_fast.get("results", {}).get("bindings", []):
-                iri  = b["id"]["value"]
-                acc  = b.get("acc", {}).get("value") or iri.rsplit("/", 1)[-1]
+                iri = b["id"]["value"]
+                acc = b.get("acc", {}).get("value") or iri.rsplit("/", 1)[-1]
                 out_fast.append({
                     "type": "uniprot:protein",
-                    "id": iri,
-                    "title": acc,
-                    "snippet": "UniProtKB protein",
-                    "url": iri,
-                    "source": "uniprot",
+                    "id": iri, "title": acc, "snippet": "UniProtKB protein",
+                    "url": iri, "source": "uniprot"
                 })
             if out_fast:
                 return out_fast
-        # if no hits (or an error), fall through to general label search
+        # fall through if no hits
 
-    # 2) General label search (your original query); this can be slow on UniProt → use longer timeout
-    q = UNIPROT_LABEL_SEARCH % (_sparql_str(needle), limit)
-    data = await _post_sparql(UNIPROT, q, timeout=90.0)  # bump read timeout for UniProt label lookups
+    # 2) Free-text across protein label + organism label (no taxon hardcoding)
+    q_text = _build_uniprot_text_query_free(needle, limit)
+    data = await _post_sparql(UNIPROT, q_text, timeout=90.0)  # UniProt can be slow
 
     if "error" in data:
         return [{
-            "type": "error",
-            "id": "uniprot",
-            "title": "UniProt SPARQL error",
+            "type": "error", "id": "uniprot", "title": "UniProt SPARQL error",
             "snippet": f"{data['error'].get('status_code')} — {data['error'].get('body','')[:160]}",
-            "url": UNIPROT,
-            "source": "uniprot",
+            "url": UNIPROT, "source": "uniprot"
         }]
 
     out: List[Dict[str, Any]] = []
     for b in data.get("results", {}).get("bindings", []):
-        iri = b["id"]["value"]
-        title = b.get("label", {}).get("value") or b.get("acc", {}).get("value") or iri.rsplit("/", 1)[-1]
+        iri   = b["id"]["value"]
+        acc   = b.get("acc", {}).get("value")
+        label = b.get("label", {}).get("value") or acc or iri.rsplit("/", 1)[-1]
         out.append({
             "type": "uniprot:protein",
-            "id": iri,
-            "title": title,
-            "snippet": "UniProtKB protein",
-            "url": iri,
-            "source": "uniprot",
+            "id": iri, "title": label, "snippet": "UniProtKB protein",
+            "url": iri, "source": "uniprot"
         })
     return out
+
 
 
 async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -208,7 +260,7 @@ async def _search_rhea_labels(needle: str, limit: int = 10) -> List[Dict[str, An
 
 # -------------------- Public search/fetch --------------------
 
-@mcp.tool(name="search", description="Search UniProt and/or Rhea by label, mnemonic, or ID.")
+@mcp.tool(name="search", description="Organism-aware free-text search for UniProt and/or Rhea by label or ID. Accepts queries like 'lactate dehydrogenase A Homo sapiens'.")
 async def search(query: str, limit: int = 10, language: str = "en", source: str = "both"):
     results: List[Dict[str, Any]] = []
     src = (source or "both").lower()
