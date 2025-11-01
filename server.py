@@ -2,7 +2,7 @@
 import os
 import re
 import asyncio
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
@@ -81,7 +81,165 @@ async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) ->
 
     return {"error": {"status_code": 599, "body": "All SPARQL attempts failed"}}
 
-# -------------------- Tools (NL→SPARQL execution) --------------------
+# -------------------- Helpers --------------------
+def _escape_for_contains(s: str) -> str:
+    # Escape backslashes and double quotes for safe embedding
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+def _mk_limit(limit: Optional[int], default: int = 200) -> int:
+    try:
+        n = int(limit) if limit is not None else default
+        return max(1, min(n, 2000))
+    except Exception:
+        return default
+
+# -------------------- Tools (structured query builders) --------------------
+@mcp.tool(
+    name="reactions_producing_product_from_substrate_names",
+    description=(
+        "Find APPROVED Rhea reactions that convert a given substrate name to a given product name.\n"
+        "Matches by compound names (case-insensitive, contains).\n"
+        "Directionality is enforced via rh:transformableTo (left→right).\n\n"
+        "Args:\n"
+        "  substrate_name: e.g. \"L-glutamine\"\n"
+        "  product_name:   e.g. \"ammonia\"\n"
+        "  limit:          optional integer (default 200)\n"
+        "Returns: ?reaction IRI and ?equation string."
+    )
+)
+async def reactions_producing_product_from_substrate_names(
+    substrate_name: str,
+    product_name: str,
+    limit: Optional[int] = None
+):
+    s_name = _escape_for_contains(substrate_name or "")
+    p_name = _escape_for_contains(product_name or "")
+    lim = _mk_limit(limit, 200)
+    if not s_name or not p_name:
+        return {"error": "Provide both substrate_name and product_name"}
+
+    q = f"""
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rh:   <http://rdf.rhea-db.org/>
+
+SELECT DISTINCT ?reaction ?equation WHERE {{
+  ?reaction rdfs:subClassOf rh:Reaction ;
+            rh:status rh:Approved ;
+            rh:equation ?equation ;
+            rh:side ?left, ?right .
+  ?left  rh:transformableTo ?right .
+
+  ?left  rh:contains ?p1 .
+  ?p1    rh:compound ?c1 .
+  ?c1    rh:name ?n1 .
+  FILTER(CONTAINS(LCASE(STR(?n1)), "{s_name.lower()}"))
+
+  ?right rh:contains ?p2 .
+  ?p2    rh:compound ?c2 .
+  ?c2    rh:name ?n2 .
+  FILTER(CONTAINS(LCASE(STR(?n2)), "{p_name.lower()}"))
+}}
+ORDER BY ?reaction
+LIMIT {lim}
+"""
+    return await _exec_sparql_json(RHEA_SPARQL, q)
+
+
+@mcp.tool(
+    name="reactions_by_ec",
+    description=(
+        "Find APPROVED Rhea reactions for a given EC number.\n"
+        "Args:\n"
+        "  ec_number: string like '1.11.1.6'\n"
+        "  limit: optional integer (default 200)\n"
+        "Returns: ?reaction and ?equation."
+    )
+)
+async def reactions_by_ec(ec_number: str, limit: Optional[int] = None):
+    num = (ec_number or "").strip()
+    lim = _mk_limit(limit, 200)
+    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", num):
+        return {"error": "Invalid EC number format (expected a.b.c.d)"}
+    q = f"""
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rh:   <http://rdf.rhea-db.org/>
+PREFIX ec:   <http://purl.uniprot.org/enzyme/>
+
+SELECT ?reaction ?equation WHERE {{
+  ?reaction rdfs:subClassOf rh:Reaction ;
+            rh:status rh:Approved ;
+            rh:equation ?equation ;
+            rh:ec ec:{num} .
+}}
+ORDER BY ?reaction
+LIMIT {lim}
+"""
+    return await _exec_sparql_json(RHEA_SPARQL, q)
+
+
+@mcp.tool(
+    name="find_reaction_by_equation_text",
+    description=(
+        "Search reactions by equation text (case-insensitive substring match on rh:equation).\n"
+        "Args:\n"
+        "  contains_text: e.g. 'alcohol + NAD+' or '2 H2O2'\n"
+        "  limit: optional integer (default 50)\n"
+        "Returns: ?reaction, ?accession, ?equation."
+    )
+)
+async def find_reaction_by_equation_text(contains_text: str, limit: Optional[int] = None):
+    text = _escape_for_contains(contains_text or "")
+    lim = _mk_limit(limit, 50)
+    if not text:
+        return {"error": "Provide contains_text"}
+
+    q = f"""
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rh:   <http://rdf.rhea-db.org/>
+
+SELECT ?reaction ?accession ?equation WHERE {{
+  ?reaction rdfs:subClassOf rh:Reaction ;
+            rh:accession ?accession ;
+            rh:equation  ?equation .
+  FILTER(CONTAINS(LCASE(STR(?equation)), "{text.lower()}"))
+}}
+LIMIT {lim}
+"""
+    return await _exec_sparql_json(RHEA_SPARQL, q)
+
+
+@mcp.tool(
+    name="children_of_reaction",
+    description=(
+        "Fetch specific child reactions of a given parent reaction (by RHEA:<digits>), "
+        "following rdfs:subClassOf+.\n"
+        "Args:\n"
+        "  parent_rhea_id: e.g. 'RHEA:12345'\n"
+        "  limit: optional integer (default 500)\n"
+        "Returns: ?child and ?childEq."
+    )
+)
+async def children_of_reaction(parent_rhea_id: str, limit: Optional[int] = None):
+    lim = _mk_limit(limit, 500)
+    m = re.match(r"^RHEA:(\d+)$", (parent_rhea_id or "").strip(), re.IGNORECASE)
+    if not m:
+        return {"error": "Provide parent_rhea_id like 'RHEA:12345'"}
+    num = m.group(1)
+    q = f"""
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX rh:   <http://rdf.rhea-db.org/>
+
+SELECT ?child ?childEq WHERE {{
+  VALUES (?parent) {{ (rh:{num}) }}
+  ?child rdfs:subClassOf+ ?parent ;
+         rh:equation ?childEq .
+}}
+ORDER BY ?child
+LIMIT {lim}
+"""
+    return await _exec_sparql_json(RHEA_SPARQL, q)
+
+# -------------------- Raw tools (kept for power users) --------------------
 @mcp.tool(
     name="execute_sparql_rhea",
     description=(
@@ -92,9 +250,11 @@ async def _exec_sparql_json(endpoint: str, query: str, timeout: float = 60.0) ->
         "  • Prefer:\n"
         "      PREFIX rh:   <http://rdf.rhea-db.org/>\n"
         "      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
-        "  • Reaction classes: rdfs:subClassOf rh:Reaction\n"
-        "  • Accession: rh:accession; equation text: rdfs:label\n"
-        "  • For text search: LCASE/CONTAINS on STR(?eq)/STR(?acc)\n"
+        "  • Reaction class: ?r rdfs:subClassOf rh:Reaction\n"
+        "  • Use rh:equation for reaction text; rh:accession for IDs.\n"
+        "  • EC links: PREFIX ec: <http://purl.uniprot.org/enzyme/> then ?r rh:ec ec:1.11.1.6\n"
+        "  • Participants: ?r rh:side ?s . ?s rh:contains ?p . ?p rh:compound ?c .\n"
+        "  • Directionality: left ?s1 rh:transformableTo ?s2 right.\n"
         "  • Always include a LIMIT; escape double-quotes in strings."
     )
 )
@@ -144,10 +304,6 @@ async def debug_ping():
     return {"rhea": rh, "http2_enabled": use_h2, "h2_installed": _H2_AVAILABLE}
 
 # -------------------- ASGI app (root-friendly) --------------------
-# The MCP SSE endpoint is at "/". Some clients probe "/" without SSE.
-# Wrap the SSE app so:
-#   - If Accept: text/event-stream  -> hand off to MCP SSE
-#   - Otherwise                      -> return 200 health text (no 400s)
 sse_app = mcp.streamable_http_app()
 
 async def _plain_200(scope, receive, send, body: str = "MCP server OK (root)."):
@@ -168,19 +324,15 @@ class RootOrSSE:
             return await self.sse(scope, receive, send)
 
         path = scope.get("path", "/") or "/"
-        # Normalize headers
         hdrs = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
         accept = hdrs.get("accept", "")
 
-        # Health endpoint
         if path == "/healthz":
             return await _plain_200(scope, receive, send, "ok")
 
-        # MCP SSE handshake if client asks for event-stream
         if "text/event-stream" in accept:
             return await self.sse(scope, receive, send)
 
-        # Otherwise, return a friendly 200 (prevents spurious 400s on reachability checks)
         return await _plain_200(scope, receive, send)
 
 app = RootOrSSE(sse_app)
