@@ -20,12 +20,36 @@ Run:
 
 import os
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+# ---------------------------------------------------------------------------
+# Allowed Hosts — required when MCP DNS rebinding protection is enabled
+# Requests with Host not in this list get 421 Misdirected Request.
+# On Render, set ALLOWED_HOSTS or rely on RENDER_EXTERNAL_HOSTNAME.
+# ---------------------------------------------------------------------------
+
+def _allowed_hosts() -> list[str]:
+    hosts = ["localhost", "127.0.0.1"]
+    env_hosts = os.getenv("ALLOWED_HOSTS", "").strip()
+    if env_hosts:
+        hosts.extend(h.strip() for h in env_hosts.split(",") if h.strip())
+    render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if render_host and render_host not in hosts:
+        hosts.append(render_host)
+    return hosts
+
 
 # ---------------------------------------------------------------------------
 # 1. Create the MCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("graph-bio")
+mcp = FastMCP(
+    "graph-bio",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts(),
+    ),
+)
 mcp.settings.streamable_http_path = "/"
 
 # ---------------------------------------------------------------------------
