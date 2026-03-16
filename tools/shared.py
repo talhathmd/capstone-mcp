@@ -4,10 +4,9 @@ Shared utilities used by both Rhea and Wikidata tool modules.
 Contains:
   - HTTP client config (User-Agent, HTTP/2 toggle)
   - SPARQL POST/GET fallback executor
-  - TTL in-memory cache (avoids repeat API calls)
   - SPARQL query linter (safety checks before hitting any endpoint)
   - Error normalization (maps raw endpoint errors to stable codes)
-  - Small helpers (string escaping, limit clamping)
+  - Small helpers
 """
 
 import os
@@ -241,7 +240,7 @@ def normalize_error(error_message: str) -> Dict[str, str]:
 # SPARQL Linter — validates queries BEFORE they hit any endpoint
 # ---------------------------------------------------------------------------
 
-# Blocked constructs: FROM / FROM NAMED / GRAPH (expensive or unexpected scope)
+# Blocked constructs: FROM / FROM NAMED / GRAPH
 _BLOCKED_KEYWORDS_RE = re.compile(
     r"\b(FROM\s+NAMED|FROM\s+<|GRAPH\s+[?<])\b",
     re.IGNORECASE,
@@ -319,9 +318,9 @@ def lint_sparql(
       3. Blocks unbounded property paths (* / +) — after stripping string
          literals to avoid false positives on things like "10*2"
       4. Allows only SERVICE wikibase:label; blocks all other SERVICE
-      5. For Wikidata: **mandatory** grounding check — if the query contains
-         wd:Q… or wdt:/p:/ps:/pq:P… IDs, the corresponding allowed list
-         MUST be provided.  Forgetting to pass them = hard block.
+      5. For Wikidata: optional grounding check — if allowlists are provided,
+         any wd:Q… or wdt:/p:/ps:/pq:P… IDs in the query must come from those
+         lists.  If allowlists are omitted, IDs in the query are allowed.
       6. Warns if SERVICE wikibase:label is used with a large LIMIT
       7. Warns if triple-pattern count looks high
 
@@ -395,9 +394,9 @@ def lint_sparql(
         )
 
     # ---- Entity / Property validation (Wikidata) ----
-    # MANDATORY: if the query references wd:Q… or wdt:P… IDs, the caller
-    # MUST have provided the corresponding allowed-list.  This prevents the
-    # LLM from skipping grounding and hallucinating IDs.
+    # OPTIONAL: if allowlists are provided, enforce that any referenced
+    # wd:Q… or wdt:P… IDs come from those lists.  If allowlists are omitted
+    # (None), IDs in the query are allowed and no grounding check is applied.
     if source == "wikidata":
         used_entities = set(re.findall(r"\bwd:(Q\d+)\b", q))
         used_properties: set = set()
@@ -406,14 +405,8 @@ def lint_sparql(
                 re.findall(rf"\b{prefix}:(P\d+)\b", q)
             )
 
-        # Block if query has entity IDs but no allowed list was passed
-        if used_entities and not allowed_entity_ids:
-            errors.append(
-                f"Query references entity IDs ({', '.join(sorted(used_entities))}) "
-                "but no allowed_entities list was provided. "
-                "Call search_entity first and pass the results."
-            )
-        elif allowed_entity_ids and used_entities:
+        # If an entity allowlist is explicitly provided, restrict IDs to it.
+        if allowed_entity_ids is not None and used_entities:
             bad = used_entities - allowed_entity_ids
             if bad:
                 errors.append(
@@ -422,14 +415,8 @@ def lint_sparql(
                     "Call search_entity first."
                 )
 
-        # Block if query has property IDs but no allowed list was passed
-        if used_properties and not allowed_property_ids:
-            errors.append(
-                f"Query references property IDs ({', '.join(sorted(used_properties))}) "
-                "but no allowed_properties list was provided. "
-                "Call search_property first and pass the results."
-            )
-        elif allowed_property_ids and used_properties:
+        # If a property allowlist is explicitly provided, restrict IDs to it.
+        if allowed_property_ids is not None and used_properties:
             bad = used_properties - allowed_property_ids
             if bad:
                 errors.append(

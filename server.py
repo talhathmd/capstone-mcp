@@ -1,22 +1,3 @@
-"""
-MCP server — entry point.
-
-This is the main file you run.  It creates the FastMCP instance,
-registers tools from sub-modules (Rhea + Wikidata), and sets up the
-ASGI application with health-check routing.
-
-Architecture:
-  server.py             ← you are here
-  tools/
-    __init__.py          — package docstring
-    shared.py            — HTTP client, SPARQL execution, caching, linting
-    rhea.py              — Rhea biochemical reaction tools
-    wikidata.py          — Wikidata grounding + SPARQL tools
-
-Run:
-  python server.py           (default port 8080)
-  PORT=9000 python server.py (custom port)
-"""
 
 import os
 from mcp.server.fastmcp import FastMCP
@@ -25,7 +6,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 # ---------------------------------------------------------------------------
 # Allowed Hosts — required when MCP DNS rebinding protection is enabled
 # Requests with Host not in this list get 421 Misdirected Request.
-# On Render, set ALLOWED_HOSTS or rely on RENDER_EXTERNAL_HOSTNAME.
 # ---------------------------------------------------------------------------
 
 def _allowed_hosts() -> list[str]:
@@ -56,7 +36,7 @@ mcp.settings.streamable_http_path = "/"
 # 2. Register tools from each sub-module
 # ---------------------------------------------------------------------------
 
-from tools import rhea, wikidata  # noqa: E402
+from tools import rhea, wikidata
 
 rhea.register(mcp)
 wikidata.register(mcp)
