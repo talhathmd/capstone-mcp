@@ -121,3 +121,61 @@ Environment variables:
 - Only SELECT and ASK queries are supported (CONSTRUCT/DESCRIBE are rejected)
 - WDQS rate-limits aggressively; the server self-throttles to stay under limits
 - Results capped at 500 rows for Wikidata, 2000 for Rhea
+
+## Benchmark: QAWiki (Gold + Text→SPARQL)
+
+### Gold runner (execute provided SPARQL)
+
+```bash
+python3 -m benchmarks.qawiki_gold_runner \
+  --tsv qawiki-v1-simple-2025-09-09.tsv \
+  --out gold_full_100.csv \
+  --n 100 \
+  --timeout_ms 30000 \
+  --limit_cap 200
+```
+
+### Text→SPARQL runner (LLM generates SPARQL, then we execute + score)
+
+Required environment variables:
+
+**OpenAI**
+
+- **`LLM_PROVIDER`**: `openai`
+- **`OPENAI_API_KEY`**: your API key (do not commit)
+- **`LLM_MODEL`**: model name (string)
+- **`OPENAI_BASE_URL`** (optional): defaults to `https://api.openai.com/v1/chat/completions`
+
+**Anthropic**
+
+- **`LLM_PROVIDER`**: `anthropic`
+- **`ANTHROPIC_API_KEY`**: your API key
+- **`LLM_MODEL`**: e.g. `claude-3-5-sonnet-20241022`
+- **`ANTHROPIC_BASE_URL`** (optional): defaults to `https://api.anthropic.com/v1/messages`
+
+Run (OpenAI example):
+
+```bash
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY="..."
+export LLM_MODEL="..."
+
+python3 -m benchmarks.qawiki_text2sparql_runner \
+  --gold_csv gold_full_100.csv \
+  --out_csv qawiki_pred_results.csv \
+  --n 100 \
+  --timeout_ms 30000 \
+  --limit_cap 200 \
+  --max_concurrency 1
+```
+
+The runner writes:
+
+- `qawiki_pred_results.csv`: per-question outputs (pred SPARQL, pred answers, EM/F1, errors)
+- `benchmarks/logs/qawiki_text2sparql_<timestamp>.jsonl`: prompt + raw response + parsed SPARQL per item
+
+## Web UI (Next.js on Vercel)
+
+The `web/` directory is a Next.js app that compares **MCP + LLM** vs **plain LLM** side by side (same model, one question). Deploy it on Vercel with **Root Directory** set to `web`. Copy `web/.env.example` to Vercel project environment variables; set `MCP_SERVER_URL` to your deployed Python MCP origin and add that host to the MCP server’s `ALLOWED_HOSTS` so streamable HTTP is not rejected with 421.
+
+**LLM API keys** (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are read by the **Next.js app only** when you choose a provider in the UI. The Python MCP server does not call OpenAI or Anthropic; it only exposes SPARQL tools.

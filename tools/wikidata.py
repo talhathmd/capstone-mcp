@@ -129,6 +129,103 @@ async def _wikidata_api(params: dict, timeout: float = 15.0) -> dict:
         return {"error": {"status_code": 0, "body": str(e)[:500]}}
 
 
+async def search_entity_core(
+    text: str,
+    k: int = 5,
+    context: str = "",
+) -> Dict[str, Any]:
+    """
+    Core entity grounding helper (usable outside MCP).
+
+    Mirrors the MCP tool behavior: returns ranked candidates with
+    id (QID), label, description, concepturi.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"error": "Provide search text."}
+    k = max(1, min(int(k), 20))
+
+    cache_key = entity_cache.make_key("wd_ent", text.lower(), k)
+    cached = entity_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "action": "wbsearchentities",
+        "format": "json",
+        "language": "en",
+        "search": text,
+        "limit": k,
+        "type": "item",
+    }
+    raw = await _wikidata_api(params)
+    if "error" in raw:
+        return raw
+
+    candidates = []
+    for item in raw.get("search", []):
+        candidates.append(
+            {
+                "id": item.get("id", ""),
+                "label": item.get("label", ""),
+                "description": item.get("description", ""),
+                "concepturi": item.get("concepturi", ""),
+            }
+        )
+
+    response = {"candidates": candidates, "query": text, "context": context}
+    entity_cache.set(cache_key, response)
+    return response
+
+
+async def search_property_core(
+    text: str,
+    k: int = 5,
+    context: str = "",
+) -> Dict[str, Any]:
+    """
+    Core property grounding helper (usable outside MCP).
+
+    Mirrors the MCP tool behavior: returns ranked candidates with
+    id (PID), label, description.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"error": "Provide search text."}
+    k = max(1, min(int(k), 20))
+
+    cache_key = property_cache.make_key("wd_prop", text.lower(), k)
+    cached = property_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "action": "wbsearchentities",
+        "format": "json",
+        "language": "en",
+        "search": text,
+        "limit": k,
+        "type": "property",
+    }
+    raw = await _wikidata_api(params)
+    if "error" in raw:
+        return raw
+
+    candidates = []
+    for item in raw.get("search", []):
+        candidates.append(
+            {
+                "id": item.get("id", ""),
+                "label": item.get("label", ""),
+                "description": item.get("description", ""),
+            }
+        )
+
+    response = {"candidates": candidates, "query": text, "context": context}
+    property_cache.set(cache_key, response)
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Helper: execute SPARQL against WDQS with throttle + backoff awareness
 # ---------------------------------------------------------------------------
@@ -150,6 +247,253 @@ async def _exec_wdqs(query: str, timeout: float = 30.0) -> Dict[str, Any]:
         _record_success()
 
     return result
+
+
+async def run_sparql_wikidata_core(
+    query: str,
+    timeout_ms: int = 30000,
+    limit_cap: int = 200,
+    allowed_entities: list[str] | None = None,
+    allowed_properties: list[str] | None = None,
+    allow_unbounded_property_paths: bool = False,
+) -> Dict[str, Any]:
+    """
+    Core execution logic for Wikidata SPARQL queries.
+
+    This is the same safety + dry-run + bounded auto-repair pipeline that
+    backs the MCP tool `run_sparql_wikidata`, but extracted so it can be used
+    by benchmark scripts as well.
+    """
+    # Maximum internal auto-repair attempts (1 initial + up to 2 repairs)
+    max_repairs = 2
+
+    start = time.time()
+    query = (query or "").strip()
+
+    # Basic sanity checks
+    if not query:
+        return {
+            "ok": False,
+            "error_message": "Empty query.",
+            "error_code": "SYNTAX",
+        }
+    if re.search(r"\b(CONSTRUCT|DESCRIBE)\b", query, re.IGNORECASE):
+        return {
+            "ok": False,
+            "error_message": "Only SELECT or ASK queries are supported.",
+            "error_code": "SYNTAX",
+        }
+
+    # Clamp parameters to safe ranges
+    timeout_s = max(5, min(int(timeout_ms), 60_000)) / 1000.0
+    limit_cap = max(1, min(int(limit_cap), 500))
+
+    # ---- Step 1: Lint the query ----
+    lint = lint_sparql(
+        query,
+        allowed_entity_ids=(
+            set(allowed_entities) if allowed_entities else None
+        ),
+        allowed_property_ids=(
+            set(allowed_properties) if allowed_properties else None
+        ),
+        limit_cap=limit_cap,
+        source="wikidata",
+        allow_unbounded_property_paths=allow_unbounded_property_paths,
+    )
+    if not lint["ok"]:
+        return {
+            "ok": False,
+            "error_message": "; ".join(lint["errors"]),
+            "error_code": "LINTER_BLOCK",
+            "lint_errors": lint["errors"],
+            "lint_warnings": lint["warnings"],
+            "stats": {
+                "elapsed_ms": int((time.time() - start) * 1000),
+            },
+        }
+
+    clean_query = lint["query"]  # may have LIMIT injected / capped
+
+    # ---- Step 2: Check the SPARQL result cache ----
+    # Normalize whitespace so "SELECT ?x  WHERE" and
+    # "SELECT ?x\nWHERE" hit the same cache entry.
+    cache_key = sparql_cache.make_key(
+        "wdqs", normalize_sparql_for_cache(clean_query)
+    )
+    cached = sparql_cache.get(cache_key)
+    if cached is not None:
+        cached["from_cache"] = True
+        return cached
+
+    # ---- Step 3: Dry-run with LIMIT 1 to catch syntax errors ----
+    dry_query = re.sub(
+        r"\bLIMIT\s+\d+",
+        "LIMIT 1",
+        clean_query,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+    # Small dry-run retry loop for transient WDQS issues.
+    # (Keep it minimal to avoid hammering the endpoint.)
+    dry_result: Dict[str, Any] = {}
+    dry_attempts = 0
+    dry_max_attempts = 2
+    dry_timeout = min(timeout_s, 25.0)
+    for _ in range(dry_max_attempts):
+        dry_attempts += 1
+        dry_result = await _exec_wdqs(dry_query, timeout=dry_timeout)
+        if "error" not in dry_result:
+            break
+        err_body = str(dry_result.get("error", {}).get("body", ""))
+        norm = normalize_error(err_body)
+        if norm["code"] in ("RATE_LIMIT", "TIMEOUT", "ENDPOINT_ERROR"):
+            # Backoff a bit; _wdqs_throttle + exec_sparql_json retries
+            # still protect us, this just handles occasional transient failures.
+            await asyncio.sleep(1.5 * dry_attempts)
+            continue
+        break
+
+    if "error" in dry_result:
+        err_body = str(dry_result["error"].get("body", ""))
+        norm = normalize_error(err_body)
+        return {
+            "ok": False,
+            "error_message": f"Dry-run failed: {err_body[:300]}",
+            "error_code": norm["code"],
+            "hint": norm["hint"],
+            "lint_warnings": lint["warnings"],
+            "stats": {
+                "elapsed_ms": int((time.time() - start) * 1000),
+            },
+        }
+
+    # ---- Step 4: Execute with bounded auto-repair loop ----
+    #
+    # Attempt the full query. On certain failures we can auto-repair
+    # and retry up to `max_repairs` times:
+    current_query = clean_query
+    repairs_log: List[str] = []
+    last_error_code: Optional[str] = None
+    last_error_body: str = ""
+    attempts = 0
+
+    for attempt in range(1 + max_repairs):
+        attempts = attempt + 1
+        result = await _exec_wdqs(current_query, timeout=timeout_s)
+
+        # ---- Success ----
+        if "error" not in result:
+            last_error_code = None
+            last_error_body = ""
+            break
+
+        # ---- Failure — classify and decide whether to repair ----
+        err_body = str(result["error"].get("body", ""))
+        norm = normalize_error(err_body)
+        last_error_code = norm["code"]
+        last_error_body = err_body
+
+        # No more retries left — bail out
+        if attempt >= max_repairs:
+            break
+
+        # -- TIMEOUT repair strategies --
+        if last_error_code == "TIMEOUT":
+            # Strategy A: strip SERVICE wikibase:label (only try once)
+            if has_wikibase_label_service(current_query):
+                current_query = strip_wikibase_label_service(
+                    current_query
+                )
+                repairs_log.append(
+                    f"Attempt {attempts}: TIMEOUT — removed "
+                    "SERVICE wikibase:label"
+                )
+                continue
+
+            # Strategy B: halve the LIMIT
+            cur_limit = re.search(r"\bLIMIT\s+(\d+)", current_query, re.IGNORECASE)
+            if cur_limit:
+                new_lim = max(1, int(cur_limit.group(1)) // 2)
+                current_query = (
+                    current_query[: cur_limit.start(1)]
+                    + str(new_lim)
+                    + current_query[cur_limit.end(1) :]
+                )
+                repairs_log.append(
+                    f"Attempt {attempts}: TIMEOUT — halved LIMIT "
+                    f"to {new_lim}"
+                )
+                continue
+
+            break  # nothing left to try
+
+        # -- RATE_LIMIT repair: exponential backoff wait --
+        if last_error_code == "RATE_LIMIT":
+            wait_s = min(2 ** (attempt + 1), 16)
+            repairs_log.append(
+                f"Attempt {attempts}: RATE_LIMIT — waiting "
+                f"{wait_s}s before retry"
+            )
+            await asyncio.sleep(wait_s)
+            continue
+
+        # -- Anything else: can't auto-fix --
+        break
+
+    elapsed_ms = int((time.time() - start) * 1000)
+
+    # ---- If we exited the loop with an error, return it ----
+    if last_error_code is not None:
+        norm = normalize_error(last_error_body)
+        return {
+            "ok": False,
+            "error_message": last_error_body[:500],
+            "error_code": norm["code"],
+            "hint": norm["hint"],
+            "repairs": repairs_log,
+            "lint_warnings": lint["warnings"],
+            "stats": {
+                "elapsed_ms": elapsed_ms,
+                "attempts": attempts,
+            },
+        }
+
+    # ---- Step 5: Parse bindings into simple rows ----
+    bindings = result.get("results", {}).get("bindings", [])
+    rows = []
+    for b in bindings:
+        row: Dict[str, str] = {}
+        for var, val in b.items():
+            row[var] = val.get("value", "")
+        rows.append(row)
+
+    response: Dict[str, Any] = {
+        "ok": True,
+        "rows": rows,
+        "row_count": len(rows),
+        "stats": {
+            "elapsed_ms": elapsed_ms,
+            "row_count": len(rows),
+            "attempts": attempts,
+        },
+        "repairs": repairs_log,
+        "lint_warnings": lint["warnings"],
+    }
+
+    # Let the caller know if zero results came back
+    if not rows:
+        response["warning"] = (
+            "Query returned zero results. "
+            "Check entity/property IDs or try broadening the query."
+        )
+
+    # Cache successful results (use the *original* clean_query as the
+    # cache key so future identical requests hit it, even if we
+    # internally repaired this one)
+    sparql_cache.set(cache_key, response)
+    return response
 
 
 # ===================================================================
@@ -393,9 +737,6 @@ def register(mcp) -> None:
     # B.  EXECUTION TOOLS
     # ==============================================================
 
-    # Maximum internal auto-repair attempts (1 initial + up to 2 repairs)
-    _MAX_REPAIRS = 2
-
     @mcp.tool(
         name="run_sparql_wikidata",
         description=(
@@ -454,227 +795,15 @@ def register(mcp) -> None:
         allowed_entities: List[str] = [],
         allowed_properties: List[str] = [],
     ) -> Dict[str, Any]:
-        start = time.time()
-        query = (query or "").strip()
-
-        # Basic sanity checks
-        if not query:
-            return {
-                "ok": False,
-                "error_message": "Empty query.",
-                "error_code": "SYNTAX",
-            }
-        if re.search(r"\b(CONSTRUCT|DESCRIBE)\b", query, re.IGNORECASE):
-            return {
-                "ok": False,
-                "error_message": "Only SELECT or ASK queries are supported.",
-                "error_code": "SYNTAX",
-            }
-
-        # Clamp parameters to safe ranges
-        timeout_s = max(5, min(int(timeout_ms), 60_000)) / 1000.0
-        limit_cap = max(1, min(int(limit_cap), 500))
-
-        # ---- Step 1: Lint the query ----
-        lint = lint_sparql(
-            query,
-            allowed_entity_ids=(
-                set(allowed_entities) if allowed_entities else None
-            ),
-            allowed_property_ids=(
-                set(allowed_properties) if allowed_properties else None
-            ),
+        return await run_sparql_wikidata_core(
+            query=query,
+            timeout_ms=timeout_ms,
             limit_cap=limit_cap,
-            source="wikidata",
+            allowed_entities=(allowed_entities if allowed_entities else None),
+            allowed_properties=(
+                allowed_properties if allowed_properties else None
+            ),
         )
-        if not lint["ok"]:
-            return {
-                "ok": False,
-                "error_message": "; ".join(lint["errors"]),
-                "error_code": "LINTER_BLOCK",
-                "lint_errors": lint["errors"],
-                "lint_warnings": lint["warnings"],
-                "stats": {
-                    "elapsed_ms": int((time.time() - start) * 1000),
-                },
-            }
-
-        clean_query = lint["query"]   # may have LIMIT injected / capped
-
-        # ---- Step 2: Check the SPARQL result cache ----
-        # Normalize whitespace so "SELECT ?x  WHERE" and
-        # "SELECT ?x\nWHERE" hit the same cache entry.
-        cache_key = sparql_cache.make_key(
-            "wdqs", normalize_sparql_for_cache(clean_query)
-        )
-        cached = sparql_cache.get(cache_key)
-        if cached is not None:
-            cached["from_cache"] = True
-            return cached
-
-        # ---- Step 3: Dry-run with LIMIT 1 to catch syntax errors ----
-        dry_query = re.sub(
-            r"\bLIMIT\s+\d+",
-            "LIMIT 1",
-            clean_query,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-        dry_result = await _exec_wdqs(
-            dry_query, timeout=min(timeout_s, 15.0)
-        )
-
-        if "error" in dry_result:
-            err_body = str(dry_result["error"].get("body", ""))
-            norm = normalize_error(err_body)
-            return {
-                "ok": False,
-                "error_message": f"Dry-run failed: {err_body[:300]}",
-                "error_code": norm["code"],
-                "hint": norm["hint"],
-                "lint_warnings": lint["warnings"],
-                "stats": {
-                    "elapsed_ms": int((time.time() - start) * 1000),
-                },
-            }
-
-        # ---- Step 4: Execute with bounded auto-repair loop ----
-        #
-        # Attempt the full query.  On certain failures we can auto-repair
-        # and retry up to _MAX_REPAIRS times:
-        #
-        #   TIMEOUT →
-        #     repair 1: strip SERVICE wikibase:label (if present)
-        #     repair 2: halve the LIMIT
-        #
-        #   RATE_LIMIT →
-        #     wait with exponential backoff, then retry the same query
-        #
-        #   Anything else (SYNTAX, ENDPOINT_ERROR, UNKNOWN) →
-        #     can't auto-fix, return immediately
-        #
-        current_query = clean_query
-        repairs_log: List[str] = []
-        last_error_code: Optional[str] = None
-        last_error_body: str = ""
-        attempts = 0
-
-        for attempt in range(1 + _MAX_REPAIRS):
-            attempts = attempt + 1
-            result = await _exec_wdqs(current_query, timeout=timeout_s)
-
-            # ---- Success ----
-            if "error" not in result:
-                last_error_code = None
-                last_error_body = ""
-                break
-
-            # ---- Failure — classify and decide whether to repair ----
-            err_body = str(result["error"].get("body", ""))
-            norm = normalize_error(err_body)
-            last_error_code = norm["code"]
-            last_error_body = err_body
-
-            # No more retries left — bail out
-            if attempt >= _MAX_REPAIRS:
-                break
-
-            # -- TIMEOUT repair strategies --
-            if last_error_code == "TIMEOUT":
-                # Strategy A: strip SERVICE wikibase:label (only try once)
-                if has_wikibase_label_service(current_query):
-                    current_query = strip_wikibase_label_service(
-                        current_query
-                    )
-                    repairs_log.append(
-                        f"Attempt {attempts}: TIMEOUT — removed "
-                        "SERVICE wikibase:label"
-                    )
-                    continue
-
-                # Strategy B: halve the LIMIT
-                cur_limit = re.search(
-                    r"\bLIMIT\s+(\d+)", current_query, re.IGNORECASE
-                )
-                if cur_limit:
-                    new_lim = max(1, int(cur_limit.group(1)) // 2)
-                    current_query = (
-                        current_query[: cur_limit.start(1)]
-                        + str(new_lim)
-                        + current_query[cur_limit.end(1) :]
-                    )
-                    repairs_log.append(
-                        f"Attempt {attempts}: TIMEOUT — halved LIMIT "
-                        f"to {new_lim}"
-                    )
-                    continue
-                break  # nothing left to try
-
-            # -- RATE_LIMIT repair: exponential backoff wait --
-            if last_error_code == "RATE_LIMIT":
-                wait_s = min(2 ** (attempt + 1), 16)
-                repairs_log.append(
-                    f"Attempt {attempts}: RATE_LIMIT — waiting "
-                    f"{wait_s}s before retry"
-                )
-                await asyncio.sleep(wait_s)
-                continue
-
-            # -- Anything else: can't auto-fix --
-            break
-
-        elapsed_ms = int((time.time() - start) * 1000)
-
-        # ---- If we exited the loop with an error, return it ----
-        if last_error_code is not None:
-            norm = normalize_error(last_error_body)
-            return {
-                "ok": False,
-                "error_message": last_error_body[:500],
-                "error_code": norm["code"],
-                "hint": norm["hint"],
-                "repairs": repairs_log,
-                "lint_warnings": lint["warnings"],
-                "stats": {
-                    "elapsed_ms": elapsed_ms,
-                    "attempts": attempts,
-                },
-            }
-
-        # ---- Step 5: Parse bindings into simple rows ----
-        bindings = result.get("results", {}).get("bindings", [])
-        rows = []
-        for b in bindings:
-            row: Dict[str, str] = {}
-            for var, val in b.items():
-                row[var] = val.get("value", "")
-            rows.append(row)
-
-        response: Dict[str, Any] = {
-            "ok": True,
-            "rows": rows,
-            "row_count": len(rows),
-            "stats": {
-                "elapsed_ms": elapsed_ms,
-                "row_count": len(rows),
-                "attempts": attempts,
-            },
-            "repairs": repairs_log,
-            "lint_warnings": lint["warnings"],
-        }
-
-        # Let the LLM know if zero results came back
-        if not rows:
-            response["warning"] = (
-                "Query returned zero results. "
-                "Check entity/property IDs or try broadening the query."
-            )
-
-        # Cache successful results (use the *original* clean_query as the
-        # cache key so future identical requests hit it, even if we
-        # internally repaired this one)
-        sparql_cache.set(cache_key, response)
-        return response
 
     # ------------------------------------------------------------------
 

@@ -175,21 +175,37 @@ async def exec_sparql_json(
                 }
             return r.json()
 
-    # Try each method; first success wins
-    for coro in [
-        _try_post(False),
-        _try_post(True),
-        _try_get(False),
-        _try_get(True),
-    ]:
+    # Try each method; first success wins.
+    # If all fail, preserve the *last* error payload so callers can
+    # classify it (e.g., RATE_LIMIT vs timeout vs endpoint error).
+    last_error: Optional[Dict[str, Any]] = None
+    # Use callables instead of pre-created coroutines so that if we return
+    # early, we don't leave other coroutines un-awaited.
+    methods = [
+        lambda: _try_post(False),
+        lambda: _try_post(True),
+        lambda: _try_get(False),
+        lambda: _try_get(True),
+    ]
+    for method in methods:
         try:
-            res = await coro
+            res = await method()
             if "error" not in res:
                 return res
+            # Track last error for better downstream error_code mapping.
+            if isinstance(res, dict) and isinstance(res.get("error"), dict):
+                last_error = res["error"]
         except (httpx.TimeoutException, httpx.TransportError):
             continue
 
-    return {"error": {"status_code": 599, "body": "All SPARQL request attempts failed"}}
+    if last_error is not None:
+        return {"error": last_error}
+    return {
+        "error": {
+            "status_code": 599,
+            "body": "All SPARQL request attempts failed",
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +324,7 @@ def lint_sparql(
     max_triples: int = 12,
     source: str = "wikidata",
     label_service_limit: int = 50,
+    allow_unbounded_property_paths: bool = False,
 ) -> Dict[str, Any]:
     """
     Check a SPARQL query against safety rules before execution.
@@ -342,21 +359,23 @@ def lint_sparql(
     q = query.strip()
 
     # ---- LIMIT enforcement ----
-    limit_match = re.search(r"\bLIMIT\s+(\d+)", q, re.IGNORECASE)
-    if not limit_match:
-        # No LIMIT found → inject one at the end
-        q = q.rstrip().rstrip(";") + f"\nLIMIT {limit_cap}"
-        warnings.append(f"Injected LIMIT {limit_cap} (was missing).")
-    else:
-        current = int(limit_match.group(1))
-        if current > limit_cap:
-            # Replace the number in-place
-            q = (
-                q[: limit_match.start(1)]
-                + str(limit_cap)
-                + q[limit_match.end(1) :]
-            )
-            warnings.append(f"Capped LIMIT from {current} to {limit_cap}.")
+    is_ask_query = bool(re.search(r"(?m)^\s*ASK\s*\b", q, re.IGNORECASE))
+    if not is_ask_query:
+        limit_match = re.search(r"\bLIMIT\s+(\d+)", q, re.IGNORECASE)
+        if not limit_match:
+            # No LIMIT found → inject one at the end
+            q = q.rstrip().rstrip(";") + f"\nLIMIT {limit_cap}"
+            warnings.append(f"Injected LIMIT {limit_cap} (was missing).")
+        else:
+            current = int(limit_match.group(1))
+            if current > limit_cap:
+                # Replace the number in-place
+                q = (
+                    q[: limit_match.start(1)]
+                    + str(limit_cap)
+                    + q[limit_match.end(1) :]
+                )
+                warnings.append(f"Capped LIMIT from {current} to {limit_cap}.")
 
     # ---- Blocked keywords (FROM / GRAPH) ----
     if _BLOCKED_KEYWORDS_RE.search(q):
@@ -367,13 +386,14 @@ def lint_sparql(
     # ---- Unbounded property paths ----
     # Strip string literals first so "10*2" inside a FILTER doesn't
     # trigger a false positive.
-    q_no_strings = _strip_sparql_strings(q)
-    if _UNBOUNDED_PATH_RE.search(q_no_strings):
-        errors.append(
-            "Unbounded property path (* or +) detected. "
-            "Use a fixed-length path instead "
-            "(e.g. wdt:P31/wdt:P279 instead of wdt:P279*)."
-        )
+    if not allow_unbounded_property_paths:
+        q_no_strings = _strip_sparql_strings(q)
+        if _UNBOUNDED_PATH_RE.search(q_no_strings):
+            errors.append(
+                "Unbounded property path (* or +) detected. "
+                "Use a fixed-length path instead "
+                "(e.g. wdt:P31/wdt:P279 instead of wdt:P279*)."
+            )
 
     # ---- SERVICE handling (only wikibase:label allowed) ----
     all_services = list(_SERVICE_RE.finditer(q))
