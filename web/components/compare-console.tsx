@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeftRight,
   Dna,
+  GitCompare,
   Globe2,
   LogOut,
   Sparkles,
@@ -112,13 +113,19 @@ export function CompareConsole() {
       <header className="sticky top-0 z-30 border-b border-border/50 bg-background/75 backdrop-blur-xl">
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
           <div className="flex items-center gap-3">
-            <motion.div
-              className="flex size-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-500/20"
-              whileHover={{ scale: 1.03 }}
-              transition={{ type: "spring", stiffness: 400, damping: 24 }}
-            >
-              <Zap className="size-[18px]" aria-hidden />
-            </motion.div>
+            <div className="relative">
+              <div
+                className="absolute -inset-1 rounded-[14px] bg-gradient-to-br from-violet-500/35 to-indigo-600/25 blur-md"
+                aria-hidden
+              />
+              <motion.div
+                className="relative flex size-10 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-600 via-violet-600 to-indigo-700 text-white shadow-lg shadow-violet-500/30 ring-1 ring-white/25"
+                whileHover={{ scale: 1.04 }}
+                transition={{ type: "spring", stiffness: 420, damping: 22 }}
+              >
+                <GitCompare className="size-[20px]" strokeWidth={2.25} aria-hidden />
+              </motion.div>
+            </div>
             <div>
               <h1 className="text-[15px] font-semibold tracking-tight">
                 KG Compare Lab
@@ -218,9 +225,6 @@ export function CompareConsole() {
                 </div>
               </div>
             </div>
-            <Badge variant="secondary" className="w-fit shrink-0 font-normal">
-              Keys stay on the server
-            </Badge>
           </div>
         </div>
       </header>
@@ -280,7 +284,7 @@ export function CompareConsole() {
                   />
                   <ComparisonColumn
                     label="MCP"
-                    hint="Streamable HTTP · tools for selected KG"
+                    hint="SPARQL MCP tools for selected KG"
                     icon={<Zap className="size-3.5 text-violet-600/90" />}
                     lane={result.mcp}
                     tone="violet"

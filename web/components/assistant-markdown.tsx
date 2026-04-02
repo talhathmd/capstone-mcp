@@ -1,13 +1,31 @@
 import Markdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import type { Components } from "react-markdown";
 import { cn } from "@/lib/utils";
+
+import "katex/dist/katex.min.css";
 
 type Tone = "slate" | "violet";
 
 const heading =
   "mb-2 mt-3 text-sm font-semibold tracking-tight text-foreground first:mt-0";
+
+/**
+ * LaTeX display math often uses `\[ ... \]` and inline `\( ... \)`.
+ * remark-math expects `$$` / `$`; without this, `[` is parsed as markdown links
+ * and the equation looks "broken".
+ */
+function normalizeLatexDelimiters(source: string): string {
+  let s = source.replace(
+    /\\\[([\s\S]*?)\\\]/g,
+    (_, body: string) => `\n\n$$\n${body.trim()}\n$$\n\n`,
+  );
+  s = s.replace(/\\\(([\s\S]*?)\\\)/g, (_, body: string) => `$${body.trim()}$`);
+  return s;
+}
 
 export function AssistantMarkdown({
   text,
@@ -16,6 +34,8 @@ export function AssistantMarkdown({
   text: string;
   tone: Tone;
 }) {
+  const prepared = normalizeLatexDelimiters(text.trim() ? text : "—");
+
   const linkClass =
     tone === "violet"
       ? "font-medium text-violet-700 underline decoration-violet-400/55 underline-offset-[3px] transition-colors hover:text-violet-900"
@@ -108,9 +128,28 @@ export function AssistantMarkdown({
   };
 
   return (
-    <div className="assistant-markdown text-[13px] text-foreground/95">
-      <Markdown remarkPlugins={[remarkGfm, remarkBreaks]} components={components}>
-        {text.trim() ? text : "—"}
+    <div
+      className={cn(
+        "assistant-markdown text-[13px] text-foreground/95",
+        "[&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto",
+        "[&_.katex]:text-[0.95em]",
+      )}
+    >
+      <Markdown
+        remarkPlugins={[remarkGfm, remarkBreaks, remarkMath]}
+        rehypePlugins={[
+          [
+            rehypeKatex,
+            {
+              throwOnError: false,
+              strict: false,
+              errorColor: "transparent",
+            },
+          ],
+        ]}
+        components={components}
+      >
+        {prepared}
       </Markdown>
     </div>
   );
