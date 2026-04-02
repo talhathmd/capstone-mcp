@@ -9,13 +9,13 @@ export const OPENAI_MODELS = [
 ] as const;
 
 export const ANTHROPIC_MODELS = [
-  { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
-  { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet" },
-  { id: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku" },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+  { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
+  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
 ] as const;
 
 export function defaultModel(provider: ProviderId): string {
-  return provider === "openai" ? OPENAI_MODELS[1].id : ANTHROPIC_MODELS[1].id;
+  return provider === "openai" ? OPENAI_MODELS[1].id : ANTHROPIC_MODELS[0].id;
 }
 
 export function isAllowedModel(provider: ProviderId, model: string): boolean {
