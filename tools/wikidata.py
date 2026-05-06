@@ -460,14 +460,19 @@ async def run_sparql_wikidata_core(
             },
         }
 
-    # ---- Step 5: Parse bindings into simple rows ----
-    bindings = result.get("results", {}).get("bindings", [])
+    # ---- Step 5: Parse results into simple rows ----
+    # SELECT: normal SPARQL bindings.
+    # ASK: WDQS returns {"boolean": true/false} with no bindings.
     rows = []
-    for b in bindings:
-        row: Dict[str, str] = {}
-        for var, val in b.items():
-            row[var] = val.get("value", "")
-        rows.append(row)
+    if "boolean" in result:
+        rows = [{"boolean": str(bool(result.get("boolean"))).lower()}]
+    else:
+        bindings = result.get("results", {}).get("bindings", [])
+        for b in bindings:
+            row: Dict[str, str] = {}
+            for var, val in b.items():
+                row[var] = val.get("value", "")
+            rows.append(row)
 
     response: Dict[str, Any] = {
         "ok": True,
